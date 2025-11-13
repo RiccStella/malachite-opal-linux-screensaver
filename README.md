@@ -1,2 +1,11 @@
 # malachite-opal-linux-screensaver
-A one-command installer that turns FXHash generative art (Malachite Opal by Alchemist) into a Linux screensaver using Chromium kiosk mode and XScreenSaver. Works on Fedora, Ubuntu, Arch, and more. Automatically configures XScreenSaver and disables GNOME blanker.
+
+A one-command installer that turns FXHash generative art (**Malachite Opal by Alchemist**) into a Linux screensaver using Chromium/Firefox kiosk mode and XScreenSaver.  
+Works on Fedora, Ubuntu, Arch, and more. Automatically configures XScreenSaver and disables GNOME blanker.
+
+## 🚀 Install
+
+Run this in a terminal:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/RiccStella/malachite-opal-linux-screensaver/main/install.sh)
