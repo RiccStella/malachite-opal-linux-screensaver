@@ -7,9 +7,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libepoxy-dev xvfb xdotool
+      - run: python3 tools/generate_shader.py --check
       - run: python3 tools/bundle_artwork.py --check
       - run: bash -n install.sh
-      - run: shellcheck install.sh
+      - run: shellcheck install.sh tools/build_native.sh tools/install_template.sh
       - run: python3 -m unittest discover -s tests -v
-      - run: python3 -m pip install playwright==1.56.0
-      - run: python3 tools/smoke_artwork.py
+      - run: bash tools/build_native.sh
+      - run: xvfb-run -a python3 tools/smoke_native.py
+      - run: GDK_SCALE=2 xvfb-run -a python3 tools/smoke_native.py
