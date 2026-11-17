@@ -87,6 +87,8 @@ if ! command -v python3 >/dev/null || ! browser >/dev/null; then
 fi
 if [[ ${XDG_SESSION_TYPE:-} = wayland || -n ${WAYLAND_DISPLAY:-} ]]; then
   command -v swayidle >/dev/null || { echo 'swayidle is still missing.' >&2; exit 1; }
+elif [[ -n ${DISPLAY:-} ]]; then
+  command -v xprintidle >/dev/null || { echo 'xprintidle is still missing.' >&2; exit 1; }
 fi
 mkdir -p -- "$DATA" "$(dirname "$AUTO")"
 # Only our own files are replaced; keep an upgrade backup.
@@ -163,24 +165,33 @@ class Viewer:
             self.profile = None
             raise
 
+    def exited(self):
+        # Do not reap the leader before group cleanup: its reserved PID prevents
+        # an unrelated process group from reusing the ID after a wrapper exits.
+        return os.waitid(os.P_PID, self.process.pid,
+                         os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
     def stop(self):
         process, self.process = self.process, None
-        if process is not None and process.poll() is None:
-            # Own child only: never pkill Chrome or signal a PID read from disk.
+        if process is not None:
+            # The leader is still our unreaped child, even if a wrapper exited.
+            # Always clean the group, including children that ignored SIGTERM.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
             except ProcessLookupError:
                 pass
+            time.sleep(0.2)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
         if self.profile is not None:
             self.profile.cleanup()
             self.profile = None
 
     def tick(self):
-        if self.process is not None and (self.process.poll() is not None or
+        if self.process is not None and (self.exited() or
                 time.monotonic() - self.started >= MAX_DISPLAY_SECONDS):
             self.stop()
 

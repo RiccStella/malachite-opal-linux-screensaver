@@ -99,6 +99,27 @@ class InstallerTests(unittest.TestCase):
             self.assertIsNotNone(process.poll())
             self.assertFalse(profile.exists())
 
+    def test_exited_launcher_does_not_leave_children_running(self):
+        # A wrapper exits immediately but its foreground group child survives.
+        self.fake('chromium', '#!/bin/sh\nsleep 30 &\necho $! > "$HOME/child.pid"\nexit 0\n')
+        self.assertEqual(self.install().returncode, 0)
+        module = self.load()
+        with patch.dict(os.environ, self.env):
+            import time
+            viewer = module.Viewer()
+            viewer.start()
+            for _ in range(100):
+                if (self.home / 'child.pid').exists():
+                    break
+                time.sleep(.01)
+            child = int((self.home / 'child.pid').read_text())
+            time.sleep(.05)
+            viewer.tick()
+            self.assertIsNone(viewer.process)
+            # A terminated orphan may remain a zombie briefly until init reaps it.
+            proc = Path(f'/proc/{child}/stat')
+            self.assertTrue(not proc.exists() or proc.read_text().split()[2] == 'Z')
+
     def test_unsafe_runtime_rejected(self):
         self.assertEqual(self.install().returncode, 0)
         module = self.load()
