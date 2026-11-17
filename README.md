@@ -64,7 +64,7 @@ X11 uses `xprintidle` to detect idle/resume, rather than pretending a Chromium k
 - No root browser, `--no-sandbox`, `--disable-web-security`, personal cookies or extensions.
 - Temporary mode-0700 browser profile in your private `XDG_RUNTIME_DIR`; it is removed on normal cleanup.
 - Native Wayland browser backend on Wayland; process cleanup targets only the child process group this application created, never `pkill chromium`.
-- Artwork is fetched from the external HTTPS FXHash gateway at runtime. That server and browser remain trust dependencies; its page and dependencies have **not** been audited or vendored. A separate profile does not prevent all network access or renderer vulnerabilities.
+- Artwork is fetched from the owner-hosted HTTPS page at `https://589arcade.com/assets/art/zooming/index.html` at runtime. The old FXHash gateway is no longer used. The hosting server and browser remain trust dependencies; its page and dependencies have **not** been audited or vendored. A separate profile does not prevent all network access or renderer vulnerabilities.
 - An artwork window lasts at most 60 seconds to limit resource use and interference from web content. Native lock events and suspend events are also used for cleanup when supplied by `swayidle`. This does **not** prove a malicious web page cannot affect the desktop's idle timing; verify native locking with the acceptance test.
 - Hard termination/power loss can leave a temporary profile until the runtime directory is cleared at logout. No persistent browser profile is reused.
 

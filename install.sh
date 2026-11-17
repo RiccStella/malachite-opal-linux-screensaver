@@ -115,7 +115,7 @@ import sys
 import tempfile
 import time
 
-URL = 'https://onchfs.fxhash2.xyz/c9355da324616274e112b28bf33d79c90ed8d79d32ff66f0e2bd77fc5350a2e3/'
+URL = 'https://589arcade.com/assets/art/zooming/index.html'
 MAX_DISPLAY_SECONDS = 60
 BROWSERS = ('chromium', 'chromium-browser', 'google-chrome-stable', 'google-chrome')
 
