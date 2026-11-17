@@ -16,8 +16,15 @@ class InstallerTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.bin = self.home / 'bin'
         self.bin.mkdir()
-        for name in ('chromium', 'swayidle', 'xprintidle'):
+        for name in ('swayidle', 'xprintidle'):
             self.fake(name, '#!/bin/sh\nexit 0\n')
+        self.fake('pkg-config', '#!/bin/sh\nexit 0\n')
+        self.fake('cc', """#!/usr/bin/env python3
+import os, pathlib, sys
+out=pathlib.Path(sys.argv[sys.argv.index('-o')+1])
+out.write_text(os.environ.get('FAKE_VIEWER', '#!/bin/sh'+chr(10)+'exec sleep 30'+chr(10)))
+out.chmod(0o700)
+""")
         self.env = {**os.environ, 'HOME': str(self.home), 'XDG_DATA_HOME': str(self.home / 'data'),
                     'XDG_CONFIG_HOME': str(self.home / 'config'), 'XDG_RUNTIME_DIR': str(self.home),
                     'PATH': str(self.bin) + ':' + os.environ['PATH'], 'WAYLAND_DISPLAY': 'wayland-test',
@@ -69,51 +76,74 @@ class InstallerTests(unittest.TestCase):
         self.assertNotEqual(self.install().returncode, 0)
 
     def test_no_autostart(self):
+        self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.install('--no-autostart').returncode, 0)
         self.assertFalse((self.home / 'config/autostart/malachite-opal.desktop').exists())
 
-    def test_offline_artwork_installed_and_self_contained(self):
+    def test_native_viewer_installed_no_browser_dependency(self):
         self.assertEqual(self.install().returncode, 0)
-        artwork = self.runner.with_name('artwork.html')
-        self.assertEqual(artwork.read_bytes(), (ROOT / 'artwork/index.html').read_bytes())
-        text = artwork.read_text()
-        self.assertNotIn('<script src=', text)
-        self.assertNotIn('$fx', text)
-        self.assertIn("connect-src 'none'", text)
+        self.assertFalse(self.runner.with_name('artwork.html').exists())
+        self.assertTrue(os.access(self.runner.with_name('malachite-opal-viewer'), os.X_OK))
         self.assertIn('Alchemist', self.runner.with_name('ARTWORK-NOTICE.md').read_text())
-        module = self.load()
-        self.assertEqual(module.URL, artwork.as_uri())
+        module=self.load()
+        self.assertEqual(module.viewer_command(), [str(self.runner.with_name('malachite-opal-viewer'))])
 
-    def test_private_profile_and_sandbox(self):
+    def test_compile_failure_preserves_previous_install(self):
         self.assertEqual(self.install().returncode, 0)
-        module = self.load()
-        with patch.dict(os.environ, self.env):
-            command = module.browser_command('/tmp/private profile')
-        self.assertIn('--user-data-dir=/tmp/private profile', command)
-        self.assertIn('--ozone-platform=wayland', command)
-        self.assertNotIn('--no-sandbox', command)
-        self.assertNotIn('--disable-web-security', command)
+        before=self.runner.read_bytes()
+        self.fake('cc', '#!/bin/sh\nexit 1\n')
+        self.assertNotEqual(self.install('--timeout','45').returncode, 0)
+        self.assertEqual(self.runner.read_bytes(),before)
+        self.assertEqual(self.runner.with_name('timeout').read_text(),'120\n')
+
+    def test_missing_build_dependency_preserves_install(self):
+        self.assertEqual(self.install().returncode, 0)
+        before=self.runner.read_bytes()
+        self.fake('pkg-config', '#!/bin/sh\nexit 1\n')
+        run=self.install()
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('Missing dependencies',run.stderr)
+        self.assertEqual(self.runner.read_bytes(),before)
+
+    def test_native_failure_is_reported(self):
+        self.env['FAKE_VIEWER'] = '#!/bin/sh\nexit 7\n'
+        self.assertEqual(self.install().returncode,0)
+        module=self.load()
+        with patch.dict(os.environ,self.env):
+            import time
+            viewer=module.Viewer()
+            viewer.start()
+            time.sleep(.1)
+            with self.assertRaisesRegex(RuntimeError,r'exited \(7\)'):
+                viewer.tick()
+            self.assertIsNone(viewer.process)
+
+    def test_viewer_time_limit(self):
+        self.assertEqual(self.install().returncode,0)
+        module=self.load()
+        with patch.dict(os.environ,self.env):
+            viewer=module.Viewer()
+            viewer.start()
+            viewer.started-=61
+            viewer.tick()
+            self.assertIsNone(viewer.process)
 
     def test_viewer_idempotent_cleanup(self):
-        self.fake('chromium', '#!/bin/sh\nexec sleep 30\n')
         self.assertEqual(self.install().returncode, 0)
         module = self.load()
         with patch.dict(os.environ, self.env):
             viewer = module.Viewer()
             viewer.start()
             process = viewer.process
-            profile = Path(viewer.profile.name)
-            self.assertEqual(profile.stat().st_mode & 0o777, 0o700)
             viewer.start()
             self.assertIs(viewer.process, process)
             viewer.stop()
             viewer.stop()
             self.assertIsNotNone(process.poll())
-            self.assertFalse(profile.exists())
 
     def test_exited_launcher_does_not_leave_children_running(self):
         # A wrapper exits immediately but its foreground group child survives.
-        self.fake('chromium', '#!/bin/sh\nsleep 30 &\necho $! > "$HOME/child.pid"\nexit 0\n')
+        self.env['FAKE_VIEWER'] = '#!/bin/sh\nsleep 30 &\necho $! > "$HOME/child.pid"\nexit 0\n'
         self.assertEqual(self.install().returncode, 0)
         module = self.load()
         with patch.dict(os.environ, self.env):
@@ -157,7 +187,6 @@ time.sleep(.2)
 subprocess.run(args[args.index('resume')+1], shell=True, check=True)
 time.sleep(30)
 ''')
-        self.fake('chromium', '#!/bin/sh\nexec sleep 30\n')
         self.assertEqual(self.install().returncode, 0)
         p = subprocess.Popen(['python3', str(self.runner), 'daemon'], env=self.env)
         try:

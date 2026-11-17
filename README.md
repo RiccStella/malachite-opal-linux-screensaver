@@ -1,95 +1,85 @@
-# Malachite Opal Linux artwork screensaver
+# Malachite Opal native Linux screensaver
 
-Display **Malachite Opal by Alchemist** in a separate Chromium kiosk window after inactivity. Supports a COSMIC/Wayland idle path using `swayidle`, plus an X11 idle path using `xprintidle`.
+**Malachite Opal by Riccardo Stella (Alchemist)**, rendered directly with GTK3 and OpenGL. No Chromium, webview, JavaScript engine or browser profile is launched. A small Python supervisor handles idle/resume and process cleanup; it does not render pixels.
 
-**This is decorative pre-lock artwork, not a secure screen locker.** Your desktop remains responsible for locking, blanking and suspend. The installer never disables those settings. If the native lock/blank timeout happens first, the artwork may not be visible. Configure the artwork timeout shorter than the native timeout if you want to see it.
+This is **decorative pre-lock artwork, not a secure screen locker**. Keep your desktop's own lock, blanking and suspend settings enabled. No installer or viewer code changes them. The window normally occupies one display, not every monitor.
 
-## Install
+## Install or upgrade
 
-Download and inspect before executing; don't run the installer with `sudo`:
+The same one-line command works, including `--install-deps` when dependencies are missing:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fL \
-  https://raw.githubusercontent.com/RiccStella/malachite-opal-linux-screensaver/main/install.sh \
-  -o install-malachite-opal.sh
-less install-malachite-opal.sh
-bash install-malachite-opal.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/RiccStella/malachite-opal-linux-screensaver/main/install.sh) --install-deps
 ```
 
-For reproducible installs, replace `main` in the URL with a reviewed full commit SHA. Downloading `main` always retrieves the latest code; HTTPS does not establish that its contents are safe.
+For safer review, download `install.sh`, inspect it, then run it as your normal desktop user. Never prefix the whole command with sudo. Replace `main` with a reviewed full commit SHA for reproducible installation.
 
-If dependencies are missing, install them from your distribution's trusted package manager, or explicitly allow the installer to invoke it:
+The self-contained installer embeds the native source and shader, compiles locally, and only then replaces its own files. It needs Python 3, a C compiler, pkg-config, GTK3 and libepoxy development packages, plus `swayidle` on Wayland or `xprintidle` on X11. Development packages are needed because the one-file installer builds for your own CPU/distribution rather than downloading an opaque prebuilt binary.
 
-```bash
-bash install-malachite-opal.sh --install-deps --timeout 120
-```
+`--install-deps` uses only the existing apt, dnf or pacman repositories and their normal confirmation prompts. It does not add repositories, install Snap/Flatpak, remove packages, alter security settings or silently upgrade Arch's package database. Debian/Ubuntu/Pop!_OS package names include `gcc pkg-config libgtk-3-dev libepoxy-dev`; Fedora uses `gcc pkgconf gtk3-devel libepoxy-devel`; Arch uses `gcc pkgconf gtk3 libepoxy`.
 
-Packages are Python 3, a native Chromium/Google Chrome executable, and `swayidle` on Wayland or `xprintidle` on X11. Existing browsers are reused **with a new private profile**, never your normal signed-in browser profile. Firefox is intentionally not treated as a Chromium drop-in.
-
-Debian uses the `chromium` package. The installer checks package availability rather than guessing `chromium-browser`. Systems without a native Chromium package (including some Ubuntu/Pop!_OS configurations) should install a supported browser from a trusted source first. It does not silently add third-party repositories, install Snap/Flatpak, or disable browser sandboxing. Package installation errors stop installation. Arch uses `pacman -S --needed`, not a partial database refresh/upgrade.
-
-Installation is per-user under `${XDG_DATA_HOME:-$HOME/.local/share}/malachite-opal`. A dedicated desktop autostart file is created for COSMIC, XFCE, MATE, LXDE and LXQt. Nothing is launched during installation; log out/in or start the daemon manually:
+Per-user installation: `${XDG_DATA_HOME:-$HOME/.local/share}/malachite-opal`. Before replacement, an existing supervisor is told to quit and its lock is awaited. Its own previous files are retained as `.bak`. Existing Chromium packages and unrelated applications are left alone. A separately started preview is bounded to 60 seconds; close it before upgrading.
 
 ```bash
-python3 ~/.local/share/malachite-opal/runner.py daemon
-# Or a bounded manual preview:
+# Preview immediately (closes on input, or within 60 seconds):
 python3 ~/.local/share/malachite-opal/runner.py preview
-# Stop the running automatic supervisor and its own artwork browser:
+# Start idle monitoring now, or log out/in for autostart:
+python3 ~/.local/share/malachite-opal/runner.py daemon
+# Stop automatic monitoring and its own artwork:
 python3 ~/.local/share/malachite-opal/runner.py quit
 ```
 
-Use the path printed by the installer if you use a custom `XDG_DATA_HOME`. `--no-autostart` installs manual commands without enabling login startup. Re-running installation backs up this application's files as `.bak`; it never rewrites another screensaver's configuration. Quit an existing daemon before upgrading so it can restart using the new code.
+Use the paths printed by the installer with custom XDG directories. Configure inactivity with `--timeout 120` (10–86400 seconds). `--no-autostart` removes this application's login entry, without touching other startup entries. The installer never starts the viewer itself. Autostart applies to COSMIC, XFCE, MATE, LXDE and LXQt; other Wayland desktops, especially GNOME, are not advertised as supported.
 
-## COSMIC and compatibility status
+## Performance and artwork fidelity
 
-The Wayland path uses `swayidle` timeout/resume events, with its own empty configuration, to show and dismiss the artwork. COSMIC's compositor supports the idle notification mechanism used by its own `cosmic-idle`. Existing COSMIC locking remains enabled and independent; this application is not a replacement for `cosmic-idle` or the lock screen.
+The original procedural shader is preserved, translated from WebGL GLSL to desktop GLSL 150. A generated header is checked against `artwork/index.html`; color generation and tentacle/blob distributions match the offline artwork. Colors vary each run; minted FXHash seed reproduction is not supported. Output alpha is made opaque because there is no HTML page beneath the native surface. The original web canvas over black leaves RGB unchanged under its default premultiplied-alpha contract.
 
-**Implemented, but not yet visually tested on a real COSMIC session.** Automated tests cover installation, configuration preservation, profile isolation, cleanup and mocked idle callbacks. They cannot establish compositor rendering, GPU behavior, multi-monitor placement, native lock visibility or input behavior. Other Wayland desktops are not automatically enabled. GNOME Wayland is not advertised as supported.
+Animation is capped at approximately **30 FPS**, with elapsed-time motion independent of frame rate. This lowers animation work but does not promise a particular RAM/CPU reduction. On HiDPI displays the shader renders at logical resolution and is upscaled to the native surface, matching the original web canvas’s resolution policy instead of multiplying shader work by the scale factor squared. Very large logical displays still require substantial shader work. There is no continuously growing image cache or per-frame readback in ordinary operation.
 
-X11 uses `xprintidle` to detect idle/resume, rather than pretending a Chromium kiosk window is an embedded XScreenSaver module. No XScreenSaver dependency or configuration changes are required. The native locker must continue to provide password protection. Preview is a normal fullscreen browser window, normally on one display, and should not be expected to cover every monitor.
+Each launch prints `GL_RENDERER` and `GL_VERSION`. `llvmpipe`, `softpipe` or `SwiftShader` indicates software rendering, which can still be CPU-intensive even without a browser. A native rewrite cannot fix missing GPU drivers by itself. Benchmarks on a cloud software renderer are not predictions for Andrew's hardware.
 
-### COSMIC acceptance test before relying on autostart
-
-1. Keep native locking enabled and confirm it works with the keyboard shortcut.
-2. Run `runner.py preview`. Confirm the artwork renders and closes within 60 seconds.
-3. Run the daemon in a terminal with a short timeout (`--timeout 15` during installation).
-4. Stop input; confirm artwork appears. Move the mouse/type; confirm it disappears and your existing browser remains open.
-5. While artwork is visible, lock the screen. Confirm the desktop's real lock screen is displayed and authentication is still required.
-6. Test native automatic locking, suspend/resume, multi-monitor placement, repeated idle/resume and login autostart. Check for remaining browser processes after `quit`.
-7. If any lock behavior differs, stop the daemon and disable its autostart with `--no-autostart`. Do not disable the native locker to work around it.
-
-## Security boundaries
-
-- No changes to GNOME/COSMIC lock, idle, blank or suspend settings.
-- No root browser, `--no-sandbox`, `--disable-web-security`, personal cookies or extensions.
-- Temporary mode-0700 browser profile in your private `XDG_RUNTIME_DIR`; it is removed on normal cleanup.
-- Native Wayland browser backend on Wayland; process cleanup targets only the child process group this application created, never `pkill chromium`.
-- Artwork is bundled in the installer and opened using `file://`. Activating it requires **no Netlify/589arcade or FXHash request**, and works offline. A restrictive CSP blocks external resources and connections. Chromium's own system/background services are outside this artwork's bandwidth guarantee (background networking is disabled where Chromium supports it).
-- Artist credit is retained in `artwork/NOTICE.md`. FXHash SDK is not bundled; its random calls are replaced with `Math.random()`. The shader is unchanged, but minted seed reproducibility is not supported.
-- An artwork window lasts at most 60 seconds to limit resource use and interference from web content. Native lock events and suspend events are also used for cleanup when supplied by `swayidle`. This does **not** prove a malicious web page cannot affect the desktop's idle timing; verify native locking with the acceptance test.
-- Hard termination/power loss can leave a temporary profile until the runtime directory is cleared at logout. No persistent browser profile is reused.
-
-## Upgrade from the original installer
-
-The old installer disabled GNOME's lock and idle activation, changed `~/.xscreensaver`, and added `~/.config/autostart/xscreensaver.desktop`. **Installing this version does not silently undo those changes**, since you may have deliberately configured them afterward.
-
-Review your native desktop's lock settings, restore your preferred lock policy, and remove the old Malachite Opal entry/autostart only if you no longer use it. The new installer warns if the old `~/malachite-opal-screensaver.sh` exists. Do not run both old and new artwork launchers together.
-
-## Uninstall
+Advanced manual diagnostics:
 
 ```bash
-bash install-malachite-opal.sh --uninstall
+~/.local/share/malachite-opal/malachite-opal-viewer --windowed --fps 30 --duration 10
 ```
 
-This stops the new supervisor and removes its runner, timeout and autostart file. Upgrade `.bak` files remain for recovery. Bundled artwork and its attribution file are removed too. System packages and native lock settings are left alone. It does not remove or alter legacy XScreenSaver files.
+Normal launches terminate on key, button, scroll or pointer movement, and after at most 60 seconds. There are no input grabs, idle inhibitors, network requests or secure-lock claims. The Python supervisor also enforces the duration limit and cleans up only the child process group it created.
 
-## Development checks
+## COSMIC acceptance test
+
+Native rendering and COSMIC integration are separate checks. A successful preview does not establish correct idle activation or lock interaction. Before relying on autostart:
+
+1. Keep native locking enabled and verify the desktop's lock shortcut.
+2. Run preview. Check image, GL renderer, memory, CPU and input dismissal.
+3. Install with `--timeout 15`, start daemon, stop input and verify activation. Move/type and verify dismissal.
+4. Lock while visible; verify the real lock screen appears and requires authentication.
+5. Test automatic lock, suspend/resume, repeated idle/resume, multi-monitor placement and login autostart.
+6. Run `quit`; confirm its renderer is gone and unrelated apps remain open.
+
+If lock behavior differs, stop the daemon and remove its autostart with `--no-autostart`. Never disable the native locker as a workaround. The former browser preview worked on Andrew's COSMIC system; this **new native implementation still needs a real COSMIC test**.
+
+## Legacy installer and uninstall
+
+The original XScreenSaver installer changed lock settings and `~/.xscreensaver`; this version deliberately does not silently undo user settings. Review that legacy setup yourself if `~/malachite-opal-screensaver.sh` exists. Do not run both launchers.
 
 ```bash
+bash install.sh --uninstall
+```
+
+Uninstall stops the automatic supervisor and removes only its current files/autostart. `.bak` recovery files, installed distro packages, legacy XScreenSaver files and desktop settings remain.
+
+## Development
+
+```bash
+python3 tools/generate_shader.py --check
 python3 tools/bundle_artwork.py --check
 bash -n install.sh
+shellcheck install.sh tools/build_native.sh tools/install_template.sh
 python3 -m unittest discover -s tests -v
-shellcheck install.sh
+bash tools/build_native.sh
+xvfb-run -a python3 tools/smoke_native.py
 ```
 
-The local-socket integration test explicitly skips on hosts that prohibit Unix socket binding; run it on an ordinary Linux host/CI. Browser and idle commands in tests are mocks, not proof of COSMIC runtime compatibility.
+Edit `native/` and `tools/install_template.sh`, then regenerate shader/installer. The automated GTK smoke test uses Mesa software rendering, deterministic seed/time capture, bounded execution and RSS reporting. Unit tests use mock build/idle tools; the Unix-socket test skips only where the host explicitly prohibits sockets. CI runs it on an ordinary Linux host. Neither test suite establishes actual COSMIC compositor behavior or real-GPU performance.

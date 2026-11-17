@@ -4,3 +4,5 @@
 
 __pycache__/
 *.pyc
+native/malachite-opal-viewer
+*.ppm

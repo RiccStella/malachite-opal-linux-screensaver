@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Self-contained per-user installer. Does not change screen-lock settings.
+# Self-contained native per-user installer. Never changes screen-lock settings.
 set -euo pipefail
 umask 077
 ID=malachite-opal
@@ -10,10 +10,9 @@ usage() {
   cat <<'HELP'
 Usage: bash install.sh [--install-deps] [--no-autostart] [--timeout SECONDS]
                      [--uninstall] [--help]
-Installs a decorative pre-lock artwork viewer, NOT a screen locker.
-COSMIC/Wayland automatic mode uses swayidle; X11 uses xprintidle.
-Missing packages are installed only with --install-deps (may ask for sudo).
-Existing screen-lock settings and XScreenSaver configuration are never changed.
+Installs native GTK/OpenGL decorative pre-lock artwork, NOT a screen locker.
+COSMIC/Wayland uses swayidle; X11 uses xprintidle. No browser is required.
+--install-deps allows trusted distro build/runtime packages (may ask for sudo).
 HELP
 }
 while (($#)); do
@@ -35,20 +34,53 @@ fi
 DATA=${XDG_DATA_HOME:-$HOME/.local/share}/$ID
 AUTO=${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$ID.desktop
 [[ $DATA = /* && $AUTO = /* ]] || { echo 'XDG paths must be absolute.' >&2; exit 1; }
-# Reject desktop-entry metacharacters we cannot represent safely.
 [[ $DATA != *$'\n'* && $DATA != *$'\r'* && $DATA != *'%'* ]] || { echo 'Unsupported characters in installation path.' >&2; exit 1; }
 [[ ! -L $DATA && ! -L $AUTO ]] || { echo 'Refusing symlink installation target.' >&2; exit 1; }
+files=(runner.py timeout malachite-opal-viewer ARTWORK-NOTICE.md artwork.html)
+for name in "${files[@]}"; do
+  [[ ! -L $DATA/$name && ! -L $DATA/$name.bak ]] || { echo "Refusing symlink: $DATA/$name" >&2; exit 1; }
+done
+[[ ! -L $AUTO.bak ]] || { echo 'Refusing symlink autostart backup.' >&2; exit 1; }
+stop_old() {
+  if [[ -f $DATA/runner.py ]]; then
+    command -v python3 >/dev/null || { echo 'Python is needed to stop the old daemon safely.' >&2; return 1; }
+    if [[ -n ${XDG_RUNTIME_DIR:-} && -S $XDG_RUNTIME_DIR/malachite-opal/control.sock ]]; then
+      python3 "$DATA/runner.py" quit
+    fi
+    # Wait for the supervisor to release its flock, not merely accept the message.
+    python3 - <<'PY'
+import fcntl, os, time
+from pathlib import Path
+runtime = os.environ.get('XDG_RUNTIME_DIR')
+if runtime:
+    path = Path(runtime) / 'malachite-opal/daemon.lock'
+    if path.exists():
+        with path.open('r') as lock:
+            deadline = time.monotonic()+5
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic()>=deadline:
+                        raise SystemExit('Old daemon did not stop; installation left unchanged.')
+                    time.sleep(.1)
+PY
+  fi
+}
 if [[ ${action:-install} = uninstall ]]; then
-  if [[ -f $DATA/runner.py ]] && command -v python3 >/dev/null; then python3 "$DATA/runner.py" quit || true; fi
-  rm -f -- "$AUTO" "$DATA/runner.py" "$DATA/timeout" "$DATA/artwork.html" "$DATA/ARTWORK-NOTICE.md"
+  stop_old
+  rm -f -- "$AUTO"
+  for name in "${files[@]}"; do rm -f -- "$DATA/$name"; done
   rmdir -- "$DATA" 2>/dev/null || true
-  echo 'Removed Malachite Opal files. Native lock settings and legacy XScreenSaver files were not touched.'
+  echo 'Removed Malachite Opal files. Packages, native lock settings and legacy XScreenSaver files untouched.'
   exit 0
 fi
-browser() { local c; for c in chromium chromium-browser google-chrome-stable google-chrome; do command -v "$c" && return; done; return 1; }
 missing=()
 command -v python3 >/dev/null || missing+=(python3)
-if ! browser >/dev/null; then missing+=(chromium); fi
+command -v cc >/dev/null || missing+=(compiler)
+command -v pkg-config >/dev/null || missing+=(pkgconfig)
+if ! command -v pkg-config >/dev/null || ! pkg-config --exists gtk+-3.0 epoxy; then missing+=(gtk-devel); fi
 if [[ ${XDG_SESSION_TYPE:-} = wayland || -n ${WAYLAND_DISPLAY:-} ]]; then
   command -v swayidle >/dev/null || missing+=(swayidle)
 elif [[ -n ${DISPLAY:-} ]]; then
@@ -56,34 +88,35 @@ elif [[ -n ${DISPLAY:-} ]]; then
 fi
 if ((${#missing[@]})); then
   if (( ! install_deps )); then
-    echo "Missing dependencies: ${missing[*]}. Install from your distro's trusted packages or rerun with --install-deps." >&2
+    echo "Missing dependencies: ${missing[*]}. Rerun with --install-deps or install Python, C compiler, pkg-config, GTK3/epoxy development packages and your idle tool." >&2
     exit 1
   fi
-  command -v sudo >/dev/null || { echo 'sudo is unavailable; install dependencies with your system administrator.' >&2; exit 1; }
-  if command -v apt-get >/dev/null; then
-    sudo apt-get update
-    # Check the actual repository, not a guessed Debian/Ubuntu package name.
-    packages=()
-    for p in "${missing[@]}"; do
-      if [[ $p = chromium ]]; then
-        candidate=$(apt-cache policy chromium | awk '/Candidate:/ {print $2; exit}')
-        [[ -n $candidate && $candidate != '(none)' ]] || { echo 'No native chromium package. Install Chromium/Chrome from a trusted source, then rerun. No Snap or third-party repo is added automatically.' >&2; exit 1; }
-      fi
-      packages+=("$p")
-    done
-    sudo apt-get install -- "${packages[@]}"
-  elif command -v dnf >/dev/null; then
-    sudo dnf install -- "${missing[@]}"
-  elif command -v pacman >/dev/null; then
-    # Do not refresh package databases without a full upgrade (partial upgrades).
-    packages=("${missing[@]/python3/python}")
-    sudo pacman -S --needed -- "${packages[@]}"
-  else
-    echo "Unsupported package manager. Install: ${missing[*]}" >&2; exit 1
-  fi
+  command -v sudo >/dev/null || { echo 'sudo unavailable; ask your administrator to install build/runtime packages.' >&2; exit 1; }
+  packages=()
+  if command -v apt-get >/dev/null; then manager=apt
+  elif command -v dnf >/dev/null; then manager=dnf
+  elif command -v pacman >/dev/null; then manager=pacman
+  else echo 'Unsupported package manager; install dependencies manually.' >&2; exit 1; fi
+  for dep in "${missing[@]}"; do
+    case "$manager:$dep" in
+      apt:compiler|dnf:compiler|pacman:compiler) packages+=(gcc);;
+      apt:pkgconfig) packages+=(pkg-config);;
+      dnf:pkgconfig|pacman:pkgconfig) packages+=(pkgconf);;
+      apt:gtk-devel) packages+=(libgtk-3-dev libepoxy-dev);;
+      dnf:gtk-devel) packages+=(gtk3-devel libepoxy-devel);;
+      pacman:gtk-devel) packages+=(gtk3 libepoxy);;
+      pacman:python3) packages+=(python);;
+      *) packages+=("$dep");;
+    esac
+  done
+  case "$manager" in
+    apt) sudo apt-get update; sudo apt-get install -- "${packages[@]}";;
+    dnf) sudo dnf install -- "${packages[@]}";;
+    pacman) sudo pacman -S --needed -- "${packages[@]}";;
+  esac
 fi
-if ! command -v python3 >/dev/null || ! browser >/dev/null; then
-  echo 'Dependency installation incomplete.' >&2; exit 1
+if ! command -v python3 >/dev/null || ! command -v cc >/dev/null || ! pkg-config --exists gtk+-3.0 epoxy; then
+  echo 'Build dependencies are incomplete.' >&2; exit 1
 fi
 if [[ ${XDG_SESSION_TYPE:-} = wayland || -n ${WAYLAND_DISPLAY:-} ]]; then
   command -v swayidle >/dev/null || { echo 'swayidle is still missing.' >&2; exit 1; }
@@ -91,303 +124,61 @@ elif [[ -n ${DISPLAY:-} ]]; then
   command -v xprintidle >/dev/null || { echo 'xprintidle is still missing.' >&2; exit 1; }
 fi
 mkdir -p -- "$DATA" "$(dirname "$AUTO")"
-# Only our own files are replaced; keep an upgrade backup.
-for file in "$DATA/runner.py" "$DATA/timeout" "$DATA/artwork.html" "$DATA/ARTWORK-NOTICE.md" "$AUTO"; do
-  [[ ! -L $file && ! -L $file.bak ]] || { echo "Refusing symlink: $file" >&2; exit 1; }
-  if [[ -f $file ]]; then cp -p -- "$file" "$file.bak"; fi
-done
-stage=$(mktemp "$DATA/.runner.XXXXXX")
-trap 'rm -f -- "$stage"' EXIT
-cat > "$stage" <<'PY'
-#!/usr/bin/env python3
-"""Decorative browser viewer. Never a lock screen or authentication boundary."""
-import fcntl
-import os
-from pathlib import Path
-import selectors
-import shlex
-import shutil
-import signal
-import socket
-import stat
-import subprocess
-import sys
-import tempfile
-import time
-
-URL = Path(__file__).with_name('artwork.html').resolve().as_uri()
-MAX_DISPLAY_SECONDS = 60
-BROWSERS = ('chromium', 'chromium-browser', 'google-chrome-stable', 'google-chrome')
-
-
-def runtime_dir():
-    base = Path(os.environ.get('XDG_RUNTIME_DIR', ''))
-    if not base.is_absolute():
-        raise RuntimeError('A desktop XDG_RUNTIME_DIR is required.')
-    info = base.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise RuntimeError('XDG_RUNTIME_DIR must be a private directory owned by you.')
-    folder = base / 'malachite-opal'
-    folder.mkdir(mode=0o700, exist_ok=True)
-    info = folder.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-        raise RuntimeError('Unsafe runtime directory.')
-    return folder
-
-
-def browser_command(profile):
-    browser = next((shutil.which(c) for c in BROWSERS if shutil.which(c)), None)
-    if not browser:
-        raise RuntimeError('Install native Chromium or Google Chrome first.')
-    command = [browser, '--user-data-dir=' + profile, '--no-first-run',
-               '--no-default-browser-check', '--disable-sync', '--disable-extensions',
-               '--disable-background-networking',
-               '--incognito', '--kiosk']
-    if os.environ.get('WAYLAND_DISPLAY'):
-        command.append('--ozone-platform=wayland')
-    return command + [URL]
-
-
-class Viewer:
-    def __init__(self):
-        self.process = None
-        self.profile = None
-        self.started = 0
-
-    def start(self):
-        if self.process is not None:
-            return  # Repeated idle events must not spawn additional browsers.
-        self.profile = tempfile.TemporaryDirectory(prefix='profile-', dir=runtime_dir())
-        try:
-            self.process = subprocess.Popen(browser_command(self.profile.name), start_new_session=True)
-            self.started = time.monotonic()
-        except BaseException:
-            self.profile.cleanup()
-            self.profile = None
-            raise
-
-    def exited(self):
-        # Do not reap the leader before group cleanup: its reserved PID prevents
-        # an unrelated process group from reusing the ID after a wrapper exits.
-        return os.waitid(os.P_PID, self.process.pid,
-                         os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-
-    def stop(self):
-        process, self.process = self.process, None
-        if process is not None:
-            # The leader is still our unreaped child, even if a wrapper exited.
-            # Always clean the group, including children that ignored SIGTERM.
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            time.sleep(0.2)
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        if self.profile is not None:
-            self.profile.cleanup()
-            self.profile = None
-
-    def tick(self):
-        if self.process is not None and (self.exited() or
-                time.monotonic() - self.started >= MAX_DISPLAY_SECONDS):
-            self.stop()
-
-
-def send(action):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(2)
-        try:
-            client.connect(str(runtime_dir() / 'control.sock'))
-        except (FileNotFoundError, ConnectionRefusedError):
-            return
-        client.sendall(action.encode('ascii'))
-
-
-def daemon():
-    wayland = bool(os.environ.get('WAYLAND_DISPLAY'))
-    if not wayland and not os.environ.get('DISPLAY'):
-        raise RuntimeError('A Wayland or X11 desktop session is required.')
-    executable = shutil.which('swayidle' if wayland else 'xprintidle')
-    if not executable:
-        raise RuntimeError('Install swayidle (Wayland) or xprintidle (X11).')
-    seconds = int(Path(__file__).with_name('timeout').read_text().strip())
-    if not 10 <= seconds <= 86400:
-        raise RuntimeError('Invalid timeout.')
-    folder = runtime_dir()
-    # flock prevents two supervisors from sharing callbacks or browser state.
-    with open(folder / 'daemon.lock', 'a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return
-        sockpath = folder / 'control.sock'
-        sockpath.unlink(missing_ok=True)
-        viewer = Viewer()
-        alive = True
-        def shutdown(*_):
-            nonlocal alive
-            alive = False
-        signal.signal(signal.SIGTERM, shutdown)
-        signal.signal(signal.SIGINT, shutdown)
-        prefix = shlex.join([sys.executable, str(Path(__file__).resolve())])
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server, selectors.DefaultSelector() as selector:
-            server.bind(str(sockpath))
-            os.chmod(sockpath, 0o600)
-            server.listen(4)
-            selector.register(server, selectors.EVENT_READ)
-            # Ignore the user's unrelated swayidle configuration. No -w: callbacks
-            # must not block dispatch of the resume event.
-            idle = subprocess.Popen([executable, '-C', '/dev/null', 'timeout', str(seconds),
-                                     prefix + ' start', 'resume', prefix + ' stop',
-                                     'before-sleep', prefix + ' stop', 'lock', prefix + ' stop']) if wayland else None
-            was_idle = False
-            previous_idle = 0
-            try:
-                while alive:
-                    if idle is not None:
-                        status = idle.poll()
-                        if status is not None:
-                            raise RuntimeError(f'swayidle exited ({status}); compositor/protocol support must be checked.')
-                    else:
-                        result = subprocess.run([executable], check=True, capture_output=True, text=True, timeout=2)
-                        current_idle = int(result.stdout.strip())
-                        if current_idle < previous_idle:
-                            viewer.stop()
-                            was_idle = False
-                        if current_idle >= seconds * 1000 and not was_idle:
-                            viewer.start()
-                            was_idle = True
-                        previous_idle = current_idle
-                    for _, _ in selector.select(timeout=0.5):
-                        with server.accept()[0] as client:
-                            client.settimeout(0.2)
-                            try:
-                                action = client.recv(16)
-                            except socket.timeout:
-                                continue
-                            if action == b'start':
-                                viewer.start()
-                            elif action == b'stop':
-                                viewer.stop()
-                            elif action == b'quit':
-                                alive = False
-                    viewer.tick()
-            finally:
-                viewer.stop()
-                if idle is not None and idle.poll() is None:
-                    idle.terminate()
-                    try:
-                        idle.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        idle.kill()
-                        idle.wait()
-                sockpath.unlink(missing_ok=True)
-
-
-def main():
-    if os.geteuid() == 0:
-        raise RuntimeError('Do not run the artwork browser as root.')
-    action = sys.argv[1] if len(sys.argv) == 2 else 'help'
-    if action in ('start', 'stop', 'quit'):
-        send(action)
-    elif action == 'daemon':
-        daemon()
-    elif action == 'preview':
-        viewer = Viewer()
-        def interrupted(*_):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, interrupted)
-        try:
-            viewer.start()
-            while viewer.process is not None:
-                time.sleep(0.2)
-                viewer.tick()
-        finally:
-            viewer.stop()
-    else:
-        print('Usage: runner.py {preview|daemon|stop|quit}')
-        return 2
-    return 0
-
-
-if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(0)
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        print(f'Malachite Opal: {error}', file=sys.stderr)
-        sys.exit(1)
-PY
-python3 - "$stage" <<'PY'
+stage=$(mktemp -d "$DATA/.install.XXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+python3 - "$stage/viewer.c" <<'PAYLOAD_PY'
+import base64, hashlib, sys
+data=base64.b64decode('LyogTWFsYWNoaXRlIE9wYWwgYnkgUmljY2FyZG8gU3RlbGxhIChBbGNoZW1pc3QpLiBOYXRpdmUgR1RLL09wZW5HTCB2aWV3ZXIuCiAqIERlY29yYXRpdmUgcHJlLWxvY2sgYXJ0d29yayBvbmx5LiBObyBsb2NrLCBpbnB1dCBncmFicyBvciBpZGxlIGluaGliaXRvcnMuICovCiNpbmNsdWRlIDxndGsvZ3RrLmg+CiNpbmNsdWRlIDxlcG94eS9nbC5oPgojaW5jbHVkZSA8Z2xpYi11bml4Lmg+CiNpbmNsdWRlIDxtYXRoLmg+CiNpbmNsdWRlIDxzdGRpby5oPgojaW5jbHVkZSA8c3RkbGliLmg+CiNpbmNsdWRlIDxzdHJpbmcuaD4KI2luY2x1ZGUgPHNpZ25hbC5oPgojaW5jbHVkZSAic2hhZGVyLmgiCgpzdGF0aWMgR0x1aW50IHByb2dyYW0sIHZhbywgdmJvLCBzY2FsZWRfZmJvLCBzY2FsZWRfdGV4dHVyZTsKc3RhdGljIGludCBzY2FsZWRfd2lkdGgsIHNjYWxlZF9oZWlnaHQ7CnN0YXRpYyBHTGludCByZXNvbHV0aW9uX2xvY2F0aW9uLCB0aW1lX2xvY2F0aW9uOwpzdGF0aWMgZ2ludDY0IHN0YXJ0ZWQ7CnN0YXRpYyBpbnQgc3RhdHVzX2NvZGUsIGZyYW1lcywgc21va2VfZnJhbWVzOwpzdGF0aWMgZG91YmxlIGZpeGVkX3RpbWUgPSAtMTsKc3RhdGljIGNvbnN0IGNoYXIgKmNhcHR1cmVfcGF0aDsKc3RhdGljIEd0a1dpZGdldCAqd2luZG93LCAqYXJlYTsKc3RhdGljIGdib29sZWFuIHBvaW50ZXJfa25vd247CnN0YXRpYyBkb3VibGUgcG9pbnRlcl94LCBwb2ludGVyX3k7CnN0YXRpYyBndWludCB0aW1lcl9pZDsKc3RhdGljIGNvbnN0IGNoYXIgKnZlcnRleF9zb3VyY2UgPSAiI3ZlcnNpb24gMTUwXG5pbiB2ZWMyIGFfcG9zaXRpb247XG52b2lkIG1haW4oKXtnbF9Qb3NpdGlvbj12ZWM0KGFfcG9zaXRpb24sMC4wLDEuMCk7fSI7CgpzdGF0aWMgZ2Jvb2xlYW4gcXVpdChncG9pbnRlciB1bnVzZWQpIHsKICAgICh2b2lkKXVudXNlZDsKICAgIGd0a19tYWluX3F1aXQoKTsKICAgIHJldHVybiBHX1NPVVJDRV9SRU1PVkU7Cn0Kc3RhdGljIHZvaWQgZGVzdHJveWVkKEd0a1dpZGdldCAqd2lkZ2V0LCBncG9pbnRlciB1bnVzZWQpIHsKICAgICh2b2lkKXdpZGdldDsgKHZvaWQpdW51c2VkOwogICAgaWYgKGd0a19tYWluX2xldmVsKCkgPiAwKSBndGtfbWFpbl9xdWl0KCk7CiAgICB3aW5kb3cgPSBOVUxMOwp9CnN0YXRpYyB2b2lkIGZhaWwoY29uc3QgY2hhciAqbWVzc2FnZSkgewogICAgZnByaW50ZihzdGRlcnIsICJNYWxhY2hpdGUgT3BhbDogJXNcbiIsIG1lc3NhZ2UpOwogICAgc3RhdHVzX2NvZGUgPSAxOwogICAgZ19pZGxlX2FkZChxdWl0LCBOVUxMKTsKfQpzdGF0aWMgR0x1aW50IGNvbXBpbGUoR0xlbnVtIHR5cGUsIGNvbnN0IGNoYXIgKnNvdXJjZSkgewogICAgR0x1aW50IHNoYWRlciA9IGdsQ3JlYXRlU2hhZGVyKHR5cGUpOwogICAgZ2xTaGFkZXJTb3VyY2Uoc2hhZGVyLCAxLCAmc291cmNlLCBOVUxMKTsKICAgIGdsQ29tcGlsZVNoYWRlcihzaGFkZXIpOwogICAgR0xpbnQgb2s7CiAgICBnbEdldFNoYWRlcml2KHNoYWRlciwgR0xfQ09NUElMRV9TVEFUVVMsICZvayk7CiAgICBpZiAoIW9rKSB7CiAgICAgICAgY2hhciBsb2dbODE5Ml07CiAgICAgICAgZ2xHZXRTaGFkZXJJbmZvTG9nKHNoYWRlciwgc2l6ZW9mKGxvZyksIE5VTEwsIGxvZyk7CiAgICAgICAgZmFpbChsb2cpOwogICAgICAgIGdsRGVsZXRlU2hhZGVyKHNoYWRlcik7CiAgICAgICAgcmV0dXJuIDA7CiAgICB9CiAgICByZXR1cm4gc2hhZGVyOwp9CnN0YXRpYyBmbG9hdCBodWUoZmxvYXQgaCkgewogICAgaCA9IGggLSBmbG9vcmYoaCk7CiAgICBpZiAoaCA8IDEuZi82LmYpIHJldHVybiBoICogNjsKICAgIGlmIChoIDwgLjVmKSByZXR1cm4gMTsKICAgIGlmIChoIDwgMi5mLzMuZikgcmV0dXJuICgyLmYvMy5mLWgpKjY7CiAgICByZXR1cm4gMDsKfQpzdGF0aWMgdm9pZCBjb2xvcihjb25zdCBjaGFyICpuYW1lLCBkb3VibGUgaCkgewogICAgZ2xVbmlmb3JtM2YoZ2xHZXRVbmlmb3JtTG9jYXRpb24ocHJvZ3JhbSwgbmFtZSksIGh1ZShoKzEuLzMpLCBodWUoaCksIGh1ZShoLTEuLzMpKTsKfQpzdGF0aWMgdm9pZCByZWFsaXplKEd0a0dMQXJlYSAqd2lkZ2V0LCBncG9pbnRlciB1bnVzZWQpIHsKICAgICh2b2lkKXVudXNlZDsKICAgIGd0a19nbF9hcmVhX21ha2VfY3VycmVudCh3aWRnZXQpOwogICAgR0Vycm9yICplcnJvciA9IGd0a19nbF9hcmVhX2dldF9lcnJvcih3aWRnZXQpOwogICAgaWYgKGVycm9yKSB7IGZhaWwoZXJyb3ItPm1lc3NhZ2UpOyByZXR1cm47IH0KICAgIGZwcmludGYoc3RkZXJyLCAiR0xfUkVOREVSRVI6ICVzXG5HTF9WRVJTSU9OOiAlc1xuIiwgZ2xHZXRTdHJpbmcoR0xfUkVOREVSRVIpLCBnbEdldFN0cmluZyhHTF9WRVJTSU9OKSk7CiAgICBjb25zdCBjaGFyICpyZW5kZXJlciA9IChjb25zdCBjaGFyICopZ2xHZXRTdHJpbmcoR0xfUkVOREVSRVIpOwogICAgaWYgKHN0cnN0cihyZW5kZXJlciwgImxsdm1waXBlIikgfHwgc3Ryc3RyKHJlbmRlcmVyLCAic29mdHBpcGUiKSB8fCBzdHJzdHIocmVuZGVyZXIsICJTd2lmdFNoYWRlciIpKQogICAgICAgIGZwcmludGYoc3RkZXJyLCAiV0FSTklORzogc29mdHdhcmUgcmVuZGVyaW5nOyBDUFUgdXNhZ2UgbWF5IGJlIGhpZ2guXG4iKTsKICAgIEdMdWludCB2cyA9IGNvbXBpbGUoR0xfVkVSVEVYX1NIQURFUiwgdmVydGV4X3NvdXJjZSksIGZzID0gY29tcGlsZShHTF9GUkFHTUVOVF9TSEFERVIsIGZyYWdtZW50X3NvdXJjZSk7CiAgICBpZiAoIXZzIHx8ICFmcykgeyBpZih2cykgZ2xEZWxldGVTaGFkZXIodnMpOyBpZihmcykgZ2xEZWxldGVTaGFkZXIoZnMpOyByZXR1cm47IH0KICAgIHByb2dyYW0gPSBnbENyZWF0ZVByb2dyYW0oKTsKICAgIGdsQXR0YWNoU2hhZGVyKHByb2dyYW0sIHZzKTsgZ2xBdHRhY2hTaGFkZXIocHJvZ3JhbSwgZnMpOwogICAgZ2xCaW5kQXR0cmliTG9jYXRpb24ocHJvZ3JhbSwgMCwgImFfcG9zaXRpb24iKTsKICAgIGdsTGlua1Byb2dyYW0ocHJvZ3JhbSk7CiAgICBnbERlbGV0ZVNoYWRlcih2cyk7IGdsRGVsZXRlU2hhZGVyKGZzKTsKICAgIEdMaW50IG9rOwogICAgZ2xHZXRQcm9ncmFtaXYocHJvZ3JhbSwgR0xfTElOS19TVEFUVVMsICZvayk7CiAgICBpZiAoIW9rKSB7IGNoYXIgbG9nWzgxOTJdOyBnbEdldFByb2dyYW1JbmZvTG9nKHByb2dyYW0sIHNpemVvZihsb2cpLCBOVUxMLCBsb2cpOyBmYWlsKGxvZyk7IHJldHVybjsgfQogICAgZ2xVc2VQcm9ncmFtKHByb2dyYW0pOwogICAgY29uc3QgZmxvYXQgcG9zaXRpb25zW10gPSB7LTEsLTEsIDEsLTEsIC0xLDEsIC0xLDEsIDEsLTEsIDEsMX07CiAgICBnbEdlblZlcnRleEFycmF5cygxLCAmdmFvKTsgZ2xCaW5kVmVydGV4QXJyYXkodmFvKTsKICAgIGdsR2VuQnVmZmVycygxLCAmdmJvKTsgZ2xCaW5kQnVmZmVyKEdMX0FSUkFZX0JVRkZFUiwgdmJvKTsKICAgIGdsQnVmZmVyRGF0YShHTF9BUlJBWV9CVUZGRVIsIHNpemVvZihwb3NpdGlvbnMpLCBwb3NpdGlvbnMsIEdMX1NUQVRJQ19EUkFXKTsKICAgIGdsRW5hYmxlVmVydGV4QXR0cmliQXJyYXkoMCk7IGdsVmVydGV4QXR0cmliUG9pbnRlcigwLDIsR0xfRkxPQVQsR0xfRkFMU0UsMCxOVUxMKTsKICAgIGRvdWJsZSBjZW50ZXIgPSBnX3JhbmRvbV9kb3VibGUoKSwgcmFuZ2UgPSBnX3JhbmRvbV9kb3VibGUoKTsKICAgIGNvbG9yKCJjb2xvckEiLCBjZW50ZXIpOyBjb2xvcigiY29sb3JCIiwgY2VudGVyK3JhbmdlKTsgY29sb3IoImNvbG9yQyIsIGNlbnRlci1yYW5nZSk7CiAgICBnbFVuaWZvcm0xZihnbEdldFVuaWZvcm1Mb2NhdGlvbihwcm9ncmFtLCJ0ZW50YWNsZUNvdW50IiksIGdfcmFuZG9tX2ludF9yYW5nZSgyLDEzKSk7CiAgICBnbFVuaWZvcm0xZihnbEdldFVuaWZvcm1Mb2NhdGlvbihwcm9ncmFtLCJibG9iU2VlZCIpLCBnX3JhbmRvbV9pbnRfcmFuZ2UoMTAsMTAwKSk7CiAgICByZXNvbHV0aW9uX2xvY2F0aW9uID0gZ2xHZXRVbmlmb3JtTG9jYXRpb24ocHJvZ3JhbSwiaVJlc29sdXRpb24iKTsKICAgIHRpbWVfbG9jYXRpb24gPSBnbEdldFVuaWZvcm1Mb2NhdGlvbihwcm9ncmFtLCJpVGltZSIpOwogICAgZ2xEaXNhYmxlKEdMX0RFUFRIX1RFU1QpOyBnbERpc2FibGUoR0xfQkxFTkQpOwp9CnN0YXRpYyB2b2lkIHVucmVhbGl6ZShHdGtHTEFyZWEgKndpZGdldCwgZ3BvaW50ZXIgdW51c2VkKSB7CiAgICAodm9pZCl1bnVzZWQ7CiAgICBndGtfZ2xfYXJlYV9tYWtlX2N1cnJlbnQod2lkZ2V0KTsKICAgIGlmICghZ3RrX2dsX2FyZWFfZ2V0X2Vycm9yKHdpZGdldCkpIHsKICAgICAgICBnbERlbGV0ZUZyYW1lYnVmZmVycygxLCZzY2FsZWRfZmJvKTsgZ2xEZWxldGVUZXh0dXJlcygxLCZzY2FsZWRfdGV4dHVyZSk7CiAgICAgICAgZ2xEZWxldGVCdWZmZXJzKDEsJnZibyk7IGdsRGVsZXRlVmVydGV4QXJyYXlzKDEsJnZhbyk7IGdsRGVsZXRlUHJvZ3JhbShwcm9ncmFtKTsKICAgIH0KfQpzdGF0aWMgZ2Jvb2xlYW4gcmVuZGVyKEd0a0dMQXJlYSAqd2lkZ2V0LCBHZGtHTENvbnRleHQgKmNvbnRleHQsIGdwb2ludGVyIHVudXNlZCkgewogICAgKHZvaWQpY29udGV4dDsgKHZvaWQpdW51c2VkOwogICAgaWYgKCFwcm9ncmFtIHx8IHN0YXR1c19jb2RlKSByZXR1cm4gVFJVRTsKICAgIGludCBzY2FsZSA9IGd0a193aWRnZXRfZ2V0X3NjYWxlX2ZhY3RvcihHVEtfV0lER0VUKHdpZGdldCkpOwogICAgaW50IHdpZHRoID0gZ3RrX3dpZGdldF9nZXRfYWxsb2NhdGVkX3dpZHRoKEdUS19XSURHRVQod2lkZ2V0KSkqc2NhbGU7CiAgICBpbnQgaGVpZ2h0ID0gZ3RrX3dpZGdldF9nZXRfYWxsb2NhdGVkX2hlaWdodChHVEtfV0lER0VUKHdpZGdldCkpKnNjYWxlOwogICAgaWYgKHdpZHRoIDw9IDAgfHwgaGVpZ2h0IDw9IDApIHJldHVybiBUUlVFOwogICAgaW50IHJlbmRlcl93aWR0aCA9IHdpZHRoL3NjYWxlLCByZW5kZXJfaGVpZ2h0ID0gaGVpZ2h0L3NjYWxlOwogICAgR0xpbnQgdGFyZ2V0OwogICAgZ2xHZXRJbnRlZ2VydihHTF9EUkFXX0ZSQU1FQlVGRkVSX0JJTkRJTkcsICZ0YXJnZXQpOwogICAgaWYgKHNjYWxlID4gMSkgewogICAgICAgIGlmICghc2NhbGVkX2Zibykge2dsR2VuRnJhbWVidWZmZXJzKDEsJnNjYWxlZF9mYm8pOyBnbEdlblRleHR1cmVzKDEsJnNjYWxlZF90ZXh0dXJlKTt9CiAgICAgICAgZ2xCaW5kRnJhbWVidWZmZXIoR0xfRlJBTUVCVUZGRVIsc2NhbGVkX2Zibyk7CiAgICAgICAgZ2xCaW5kVGV4dHVyZShHTF9URVhUVVJFXzJELHNjYWxlZF90ZXh0dXJlKTsKICAgICAgICBpZiAocmVuZGVyX3dpZHRoIT1zY2FsZWRfd2lkdGggfHwgcmVuZGVyX2hlaWdodCE9c2NhbGVkX2hlaWdodCkgewogICAgICAgICAgICBnbFRleEltYWdlMkQoR0xfVEVYVFVSRV8yRCwwLEdMX1JHQkE4LHJlbmRlcl93aWR0aCxyZW5kZXJfaGVpZ2h0LDAsR0xfUkdCQSxHTF9VTlNJR05FRF9CWVRFLE5VTEwpOwogICAgICAgICAgICBnbFRleFBhcmFtZXRlcmkoR0xfVEVYVFVSRV8yRCxHTF9URVhUVVJFX01JTl9GSUxURVIsR0xfTElORUFSKTsKICAgICAgICAgICAgZ2xUZXhQYXJhbWV0ZXJpKEdMX1RFWFRVUkVfMkQsR0xfVEVYVFVSRV9NQUdfRklMVEVSLEdMX0xJTkVBUik7CiAgICAgICAgICAgIGdsRnJhbWVidWZmZXJUZXh0dXJlMkQoR0xfRlJBTUVCVUZGRVIsR0xfQ09MT1JfQVRUQUNITUVOVDAsR0xfVEVYVFVSRV8yRCxzY2FsZWRfdGV4dHVyZSwwKTsKICAgICAgICAgICAgc2NhbGVkX3dpZHRoPXJlbmRlcl93aWR0aDsgc2NhbGVkX2hlaWdodD1yZW5kZXJfaGVpZ2h0OwogICAgICAgIH0KICAgICAgICBpZihnbENoZWNrRnJhbWVidWZmZXJTdGF0dXMoR0xfRlJBTUVCVUZGRVIpIT1HTF9GUkFNRUJVRkZFUl9DT01QTEVURSkge2ZhaWwoIlNjYWxlZCBmcmFtZWJ1ZmZlciBpbmNvbXBsZXRlIik7IHJldHVybiBUUlVFO30KICAgIH0KICAgIGdsVmlld3BvcnQoMCwwLHJlbmRlcl93aWR0aCxyZW5kZXJfaGVpZ2h0KTsKICAgIGdsVXNlUHJvZ3JhbShwcm9ncmFtKTsgZ2xCaW5kVmVydGV4QXJyYXkodmFvKTsKICAgIGdsVW5pZm9ybTJmKHJlc29sdXRpb25fbG9jYXRpb24scmVuZGVyX3dpZHRoLHJlbmRlcl9oZWlnaHQpOwogICAgZ2xVbmlmb3JtMWYodGltZV9sb2NhdGlvbixmaXhlZF90aW1lID49IDAgPyBmaXhlZF90aW1lIDogKGdfZ2V0X21vbm90b25pY190aW1lKCktc3RhcnRlZCkvMTAwMDAwMC4pOwogICAgZ2xEcmF3QXJyYXlzKEdMX1RSSUFOR0xFUywwLDYpOwogICAgaWYgKHNjYWxlID4gMSkgewogICAgICAgIGdsQmluZEZyYW1lYnVmZmVyKEdMX1JFQURfRlJBTUVCVUZGRVIsc2NhbGVkX2Zibyk7CiAgICAgICAgZ2xCaW5kRnJhbWVidWZmZXIoR0xfRFJBV19GUkFNRUJVRkZFUiwoR0x1aW50KXRhcmdldCk7CiAgICAgICAgZ2xCbGl0RnJhbWVidWZmZXIoMCwwLHJlbmRlcl93aWR0aCxyZW5kZXJfaGVpZ2h0LDAsMCx3aWR0aCxoZWlnaHQsR0xfQ09MT1JfQlVGRkVSX0JJVCxHTF9MSU5FQVIpOwogICAgICAgIGdsQmluZEZyYW1lYnVmZmVyKEdMX0ZSQU1FQlVGRkVSLChHTHVpbnQpdGFyZ2V0KTsKICAgIH0KICAgIGlmIChnbEdldEVycm9yKCkhPUdMX05PX0VSUk9SKSB7IGZhaWwoIk9wZW5HTCBkcmF3IGZhaWxlZCIpOyByZXR1cm4gVFJVRTsgfQogICAgZnJhbWVzKys7CiAgICBpZiAoc21va2VfZnJhbWVzICYmIGZyYW1lcyA+PSBzbW9rZV9mcmFtZXMpIHsKICAgICAgICAvKiBSZWFkYmFjayBvbmx5IGluIGV4cGxpY2l0IHRlc3QgbW9kZSwgbmV2ZXIgaW4gb3JkaW5hcnkgYW5pbWF0aW9uLiAqLwogICAgICAgIHVuc2lnbmVkIGNoYXIgKnBpeGVscyA9IGdfbWFsbG9jKChnc2l6ZSl3aWR0aCpoZWlnaHQqMyk7CiAgICAgICAgZ2xQaXhlbFN0b3JlaShHTF9QQUNLX0FMSUdOTUVOVCwxKTsKICAgICAgICBnbFJlYWRQaXhlbHMoMCwwLHdpZHRoLGhlaWdodCxHTF9SR0IsR0xfVU5TSUdORURfQllURSxwaXhlbHMpOwogICAgICAgIHVuc2lnbmVkIGNoYXIgbG93PTI1NSwgaGlnaD0wOwogICAgICAgIGZvcihnc2l6ZSBpPTA7aTwoZ3NpemUpd2lkdGgqaGVpZ2h0KjM7aSsrKSB7bG93PU1JTihsb3cscGl4ZWxzW2ldKTsgaGlnaD1NQVgoaGlnaCxwaXhlbHNbaV0pO30KICAgICAgICBpZiAoZ2xHZXRFcnJvcigpIT1HTF9OT19FUlJPUiB8fCBoaWdoLWxvdzwxMCkgZmFpbCgiU21va2UgcmVuZGVyIHdhcyBlbXB0eSBvciB1bmlmb3JtIik7CiAgICAgICAgZWxzZSBmcHJpbnRmKHN0ZGVyciwiTkFUSVZFX1NNT0tFX09LIGZyYW1lcz0lZCBzaXplPSVkeCVkIHJhbmdlPSVkXG4iLGZyYW1lcyx3aWR0aCxoZWlnaHQsaGlnaC1sb3cpOwogICAgICAgIGlmKGNhcHR1cmVfcGF0aCkgewogICAgICAgICAgICBGSUxFICpmPWZvcGVuKGNhcHR1cmVfcGF0aCwid2IiKTsKICAgICAgICAgICAgaWYoIWYpIGZhaWwoIkNhbm5vdCB3cml0ZSBjYXB0dXJlIik7CiAgICAgICAgICAgIGVsc2Uge2ZwcmludGYoZiwiUDZcbiVkICVkXG4yNTVcbiIsd2lkdGgsaGVpZ2h0KTsgZm9yKGludCB5PWhlaWdodC0xO3k+PTA7eS0tKSBmd3JpdGUocGl4ZWxzKyhnc2l6ZSl5KndpZHRoKjMsMyx3aWR0aCxmKTsgZmNsb3NlKGYpO30KICAgICAgICB9CiAgICAgICAgZ19mcmVlKHBpeGVscyk7IGdfaWRsZV9hZGQocXVpdCxOVUxMKTsKICAgIH0KICAgIHJldHVybiBUUlVFOwp9CnN0YXRpYyBnYm9vbGVhbiB0aWNrKGdwb2ludGVyIHVudXNlZCkgewogICAgKHZvaWQpdW51c2VkOwogICAgZ3RrX2dsX2FyZWFfcXVldWVfcmVuZGVyKEdUS19HTF9BUkVBKGFyZWEpKTsKICAgIHJldHVybiBHX1NPVVJDRV9DT05USU5VRTsKfQpzdGF0aWMgZ2Jvb2xlYW4gaW5wdXQoR3RrV2lkZ2V0ICp3aWRnZXQsIEdka0V2ZW50ICpldmVudCwgZ3BvaW50ZXIgdW51c2VkKSB7CiAgICAodm9pZCl3aWRnZXQ7ICh2b2lkKXVudXNlZDsKICAgIGlmKHNtb2tlX2ZyYW1lcykgcmV0dXJuIEZBTFNFOwogICAgaWYoZXZlbnQtPnR5cGUgPT0gR0RLX01PVElPTl9OT1RJRlkpIHsKICAgICAgICBHZGtFdmVudE1vdGlvbiAqbW90aW9uPShHZGtFdmVudE1vdGlvbiAqKWV2ZW50OwogICAgICAgIGlmKCFwb2ludGVyX2tub3duKSB7cG9pbnRlcl94PW1vdGlvbi0+eF9yb290O3BvaW50ZXJfeT1tb3Rpb24tPnlfcm9vdDtwb2ludGVyX2tub3duPVRSVUU7cmV0dXJuIEZBTFNFO30KICAgICAgICBpZihmYWJzKG1vdGlvbi0+eF9yb290LXBvaW50ZXJfeCk8MiAmJiBmYWJzKG1vdGlvbi0+eV9yb290LXBvaW50ZXJfeSk8MikgcmV0dXJuIEZBTFNFOwogICAgfQogICAgZ3RrX21haW5fcXVpdCgpOyByZXR1cm4gVFJVRTsKfQppbnQgbWFpbihpbnQgYXJnYyxjaGFyICoqYXJndikgewogICAgaW50IGZwcz0zMCwgZHVyYXRpb249NjA7CiAgICBnYm9vbGVhbiB3aW5kb3dlZD1GQUxTRTsKICAgIGZvcihpbnQgaT0xO2k8YXJnYztpKyspIHsKICAgICAgICBpZighc3RyY21wKGFyZ3ZbaV0sIi0td2luZG93ZWQiKSkgd2luZG93ZWQ9VFJVRTsKICAgICAgICBlbHNlIGlmKGkrMTxhcmdjICYmICFzdHJjbXAoYXJndltpXSwiLS1zbW9rZS1mcmFtZXMiKSkgc21va2VfZnJhbWVzPWF0b2koYXJndlsrK2ldKTsKICAgICAgICBlbHNlIGlmKGkrMTxhcmdjICYmICFzdHJjbXAoYXJndltpXSwiLS1jYXB0dXJlIikpIGNhcHR1cmVfcGF0aD1hcmd2WysraV07CiAgICAgICAgZWxzZSBpZihpKzE8YXJnYyAmJiAhc3RyY21wKGFyZ3ZbaV0sIi0tdGltZSIpKSBmaXhlZF90aW1lPWdfYXNjaWlfc3RydG9kKGFyZ3ZbKytpXSxOVUxMKTsKICAgICAgICBlbHNlIGlmKGkrMTxhcmdjICYmICFzdHJjbXAoYXJndltpXSwiLS1zZWVkIikpIGdfcmFuZG9tX3NldF9zZWVkKChndWludDMyKWdfYXNjaWlfc3RydG91bGwoYXJndlsrK2ldLE5VTEwsMTApKTsKICAgICAgICBlbHNlIGlmKGkrMTxhcmdjICYmICFzdHJjbXAoYXJndltpXSwiLS1mcHMiKSkgZnBzPWF0b2koYXJndlsrK2ldKTsKICAgICAgICBlbHNlIGlmKGkrMTxhcmdjICYmICFzdHJjbXAoYXJndltpXSwiLS1kdXJhdGlvbiIpKSBkdXJhdGlvbj1hdG9pKGFyZ3ZbKytpXSk7CiAgICAgICAgZWxzZSB7ZnByaW50ZihzdGRlcnIsIlVzYWdlOiB2aWV3ZXIgWy0td2luZG93ZWRdIFstLWZwcyAxLi42MF0gWy0tZHVyYXRpb24gMS4uNjBdIFstLXNlZWQgTl0gWy0tdGltZSBTXSBbLS1zbW9rZS1mcmFtZXMgTiAtLWNhcHR1cmUgRklMRV1cbiIpO3JldHVybiAyO30KICAgIH0KICAgIGlmKGZwczwxIHx8IGZwcz42MCB8fCBkdXJhdGlvbjwxIHx8IGR1cmF0aW9uPjYwIHx8IHNtb2tlX2ZyYW1lczwwIHx8ICFpc2Zpbml0ZShmaXhlZF90aW1lKSkgcmV0dXJuIDI7CiAgICBpZighZ3RrX2luaXRfY2hlY2soTlVMTCxOVUxMKSkge2ZwcmludGYoc3RkZXJyLCJDYW5ub3QgY29ubmVjdCB0byBkZXNrdG9wIGRpc3BsYXlcbiIpO3JldHVybiAxO30KICAgIHdpbmRvdz1ndGtfd2luZG93X25ldyhHVEtfV0lORE9XX1RPUExFVkVMKTsKICAgIGd0a193aW5kb3dfc2V0X3RpdGxlKEdUS19XSU5ET1cod2luZG93KSwiTWFsYWNoaXRlIE9wYWwiKTsKICAgIGd0a193aW5kb3dfc2V0X2RlZmF1bHRfc2l6ZShHVEtfV0lORE9XKHdpbmRvdyksNjQwLDM2MCk7CiAgICBndGtfd2luZG93X3NldF9kZWNvcmF0ZWQoR1RLX1dJTkRPVyh3aW5kb3cpLHdpbmRvd2VkKTsKICAgIGFyZWE9Z3RrX2dsX2FyZWFfbmV3KCk7CiAgICBndGtfZ2xfYXJlYV9zZXRfcmVxdWlyZWRfdmVyc2lvbihHVEtfR0xfQVJFQShhcmVhKSwzLDIpOwogICAgZ3RrX2dsX2FyZWFfc2V0X2hhc19hbHBoYShHVEtfR0xfQVJFQShhcmVhKSxGQUxTRSk7CiAgICBndGtfZ2xfYXJlYV9zZXRfaGFzX2RlcHRoX2J1ZmZlcihHVEtfR0xfQVJFQShhcmVhKSxGQUxTRSk7CiAgICBndGtfZ2xfYXJlYV9zZXRfYXV0b19yZW5kZXIoR1RLX0dMX0FSRUEoYXJlYSksRkFMU0UpOwogICAgZ3RrX2NvbnRhaW5lcl9hZGQoR1RLX0NPTlRBSU5FUih3aW5kb3cpLGFyZWEpOwogICAgZ3RrX3dpZGdldF9hZGRfZXZlbnRzKHdpbmRvdyxHREtfUE9JTlRFUl9NT1RJT05fTUFTS3xHREtfQlVUVE9OX1BSRVNTX01BU0t8R0RLX0tFWV9QUkVTU19NQVNLfEdES19TQ1JPTExfTUFTSyk7CiAgICBnX3NpZ25hbF9jb25uZWN0KGFyZWEsInJlYWxpemUiLEdfQ0FMTEJBQ0socmVhbGl6ZSksTlVMTCk7CiAgICBnX3NpZ25hbF9jb25uZWN0KGFyZWEsInVucmVhbGl6ZSIsR19DQUxMQkFDSyh1bnJlYWxpemUpLE5VTEwpOwogICAgZ19zaWduYWxfY29ubmVjdChhcmVhLCJyZW5kZXIiLEdfQ0FMTEJBQ0socmVuZGVyKSxOVUxMKTsKICAgIGdfc2lnbmFsX2Nvbm5lY3Qod2luZG93LCJkZXN0cm95IixHX0NBTExCQUNLKGRlc3Ryb3llZCksTlVMTCk7CiAgICBnX3NpZ25hbF9jb25uZWN0KHdpbmRvdywia2V5LXByZXNzLWV2ZW50IixHX0NBTExCQUNLKGlucHV0KSxOVUxMKTsKICAgIGdfc2lnbmFsX2Nvbm5lY3Qod2luZG93LCJidXR0b24tcHJlc3MtZXZlbnQiLEdfQ0FMTEJBQ0soaW5wdXQpLE5VTEwpOwogICAgZ19zaWduYWxfY29ubmVjdCh3aW5kb3csIm1vdGlvbi1ub3RpZnktZXZlbnQiLEdfQ0FMTEJBQ0soaW5wdXQpLE5VTEwpOwogICAgZ19zaWduYWxfY29ubmVjdCh3aW5kb3csInNjcm9sbC1ldmVudCIsR19DQUxMQkFDSyhpbnB1dCksTlVMTCk7CiAgICBzdGFydGVkPWdfZ2V0X21vbm90b25pY190aW1lKCk7CiAgICBpZighd2luZG93ZWQpIGd0a193aW5kb3dfZnVsbHNjcmVlbihHVEtfV0lORE9XKHdpbmRvdykpOwogICAgZ3RrX3dpZGdldF9zaG93X2FsbCh3aW5kb3cpOwogICAgR2RrV2luZG93ICpnd2luZG93PWd0a193aWRnZXRfZ2V0X3dpbmRvdyh3aW5kb3cpOwogICAgR2RrQ3Vyc29yICpjdXJzb3I9Z2RrX2N1cnNvcl9uZXdfZm9yX2Rpc3BsYXkoZ2RrX3dpbmRvd19nZXRfZGlzcGxheShnd2luZG93KSxHREtfQkxBTktfQ1VSU09SKTsKICAgIGdka193aW5kb3dfc2V0X2N1cnNvcihnd2luZG93LGN1cnNvcik7IGdfb2JqZWN0X3VucmVmKGN1cnNvcik7CiAgICB0aW1lcl9pZD1nX3RpbWVvdXRfYWRkKCgxMDAwK2Zwcy0xKS9mcHMsdGljayxOVUxMKTsKICAgIGdfdGltZW91dF9hZGRfc2Vjb25kcyhkdXJhdGlvbixxdWl0LE5VTEwpOwogICAgZ191bml4X3NpZ25hbF9hZGQoU0lHVEVSTSxxdWl0LE5VTEwpOyBnX3VuaXhfc2lnbmFsX2FkZChTSUdJTlQscXVpdCxOVUxMKTsKICAgIGd0a19tYWluKCk7CiAgICBnX3NvdXJjZV9yZW1vdmUodGltZXJfaWQpOwogICAgaWYgKHdpbmRvdykgZ3RrX3dpZGdldF9kZXN0cm95KHdpbmRvdyk7CiAgICByZXR1cm4gc3RhdHVzX2NvZGU7Cn0K',validate=True)
+if hashlib.sha256(data).hexdigest()!='f25e53100d04cb13afb9386e1dbf6c450add70494ccf7faf883ff9da9a38db9f':
+    raise SystemExit('Embedded source checksum mismatch')
+with open(sys.argv[1],'wb') as f: f.write(data)
+PAYLOAD_PY
+python3 - "$stage/shader.h" <<'PAYLOAD_PY'
+import base64, hashlib, sys
+data=base64.b64decode('LyogR2VuZXJhdGVkIGJ5IHRvb2xzL2dlbmVyYXRlX3NoYWRlci5weS4gRG8gbm90IGhhbmQgZWRpdC4gKi8Kc3RhdGljIGNvbnN0IGNoYXIgKmZyYWdtZW50X3NvdXJjZSA9CiIjdmVyc2lvbiAxNTBcbiIKIm91dCB2ZWM0IG91dHB1dENvbG9yO1xuIgoiXG4iCiIgICAgICAgXG4iCiJ1bmlmb3JtIHZlYzIgaVJlc29sdXRpb247XG4iCiJ1bmlmb3JtIGZsb2F0IGlUaW1lO1xuIgoidW5pZm9ybSBmbG9hdCB0ZW50YWNsZUNvdW50O1xuIgoidW5pZm9ybSBmbG9hdCBibG9iU2VlZDtcbiIKInVuaWZvcm0gdmVjMyBjb2xvckE7XG4iCiJ1bmlmb3JtIHZlYzMgY29sb3JCO1xuIgoidW5pZm9ybSB2ZWMzIGNvbG9yQztcbiIKIlxuIgoiZmxvYXQgcmFuZG9tKHZlYzIgc3QpIHtcbiIKIiAgICByZXR1cm4gZnJhY3Qoc2luKGRvdChzdC54eSwgdmVjMigxMi45ODk4LCA3OC4yMzMpKSkgKiA0Mzc1OC41NDUzMTIzKTtcbiIKIn1cbiIKIlxuIgoiZmxvYXQgc21vb3RoTm9pc2UodmVjMiBzdCkge1xuIgoiICAgIHZlYzIgaSA9IGZsb29yKHN0KTtcbiIKIiAgICB2ZWMyIGYgPSBmcmFjdChzdCk7XG4iCiIgICAgZiA9IGYgKiBmICogKDMuMCAtIDIuMCAqIGYpO1xuIgoiXG4iCiIgICAgZmxvYXQgYSA9IHJhbmRvbShpKTtcbiIKIiAgICBmbG9hdCBiID0gcmFuZG9tKGkgKyB2ZWMyKDEuMCwgMC4wKSk7XG4iCiIgICAgZmxvYXQgYyA9IHJhbmRvbShpICsgdmVjMigwLjAsIDEuMCkpO1xuIgoiICAgIGZsb2F0IGQgPSByYW5kb20oaSArIHZlYzIoMS4wLCAxLjApKTtcbiIKIlxuIgoiICAgIHJldHVybiBtaXgobWl4KGEsIGIsIGYueCksIG1peChjLCBkLCBmLngpLCBmLnkpO1xuIgoifVxuIgoiXG4iCiJ2b2lkIG1haW5JbWFnZShvdXQgdmVjNCBmcmFnQ29sb3IsIGluIHZlYzIgZnJhZ0Nvb3JkKSB7XG4iCiIgICAgZmxvYXQgdGltZSA9IGlUaW1lICogMC4zO1xuIgoidmVjMiB1diA9IChzaW4odGltZS9ibG9iU2VlZCszLjAqYmxvYlNlZWQpKzIuMCkqKDEyLjApIC8gMTAwLjAgKiAoZnJhZ0Nvb3JkIC0gaVJlc29sdXRpb24ueHkgLyAyLjApIC8gaVJlc29sdXRpb24ueSBcbiIKIiAgICAgICAgIC0gdmVjMihzbW9vdGhOb2lzZSh2ZWMyKHRpbWUgLyAxMC4wKzEwMDAuMCwgYmxvYlNlZWQpKSAtIDAuNSwgXG4iCiIgICAgICAgICAgICAgICAgc21vb3RoTm9pc2UodmVjMih0aW1lIC8gMTAuMCArIGJsb2JTZWVkLCBibG9iU2VlZCArIDEwMC4wKSkgLSAwLjUpO1xuIgoiLy8gQ29tcHV0ZSBkeW5hbWljIHJvdGF0aW9uIGFuZ2xlIHVzaW5nIHNtb290aCBub2lzZVxuIgoiZmxvYXQgdGhldGEgPSAzLjAqc21vb3RoTm9pc2UodmVjMih0aW1lL2Jsb2JTZWVkIC0gYmxvYlNlZWQsIGJsb2JTZWVkKSk7XG4iCiJcbiIKIi8vIDJEIFJvdGF0aW9uIE1hdHJpeFxuIgoibWF0MiByb3RNYXQgPSBtYXQyKFxuIgoiICAgIGNvcyh0aGV0YSksIC1zaW4odGhldGEpLFxuIgoiICAgIHNpbih0aGV0YSksIGNvcyh0aGV0YSlcbiIKIik7XG4iCiJcbiIKIi8vIEFwcGx5IHJvdGF0aW9uIHRvIFVWIGNvb3JkaW5hdGVzXG4iCiJ1diAqPSByb3RNYXQ7XG4iCiJcbiIKIlxuIgoiICAgIC8vICoqUkFESUFMIE1FTFRJTkcgRUZGRUNUKipcbiIKIiAgICBmbG9hdCBtZWx0U3RyZW5ndGggPSAgc2luKHRpbWUvNi4wK2Jsb2JTZWVkKSowLjUqYmxvYlNlZWQgLzEwMC4wOyAvLyBBZGp1c3QgZm9yIHN0cm9uZ2VyIG1lbHRpbmdcbiIKIiAgICBmbG9hdCBtZWx0U3BlZWQgPSAwLjEgKiAxMDAuMCAvMTAwLjA7IC8vIENvbnRyb2xzIGhvdyBmYXN0IGl0IFwiZHJpcHNcIlxuIgoiICAgIFxuIgoiICAgIC8vIE1ha2UgdGhlIGRpc3RvcnRpb24gKipyYWRpYXRlIGZyb20gdGhlIGNlbnRlcioqXG4iCiJ2ZWMyIG1lbHRPZmZzZXQgPSBub3JtYWxpemUodXYpICogKHNtb290aE5vaXNlKHV2ICogMTAwLjAgKyBtZWx0U3BlZWQgKiAxMDAuMCAvIDEwMC4wKS0wLjUpICogbWVsdFN0cmVuZ3RoO1xuIgoiICAgIFxuIgoiICAgIC8vIEFwcGx5IG1lbHRpbmcgZGlzdG9ydGlvblxuIgoiICAgIHV2ICs9IG1lbHRPZmZzZXQ7XG4iCiJcbiIKIiAgICBmbG9hdCBhbmdsZSA9IGF0YW4odXYueSwgdXYueCk7XG4iCiIgICAgZmxvYXQgcmFkaXVzID0gbGVuZ3RoKHV2KSArIHNtb290aE5vaXNlKHV2ICogMTAuMCArIGJsb2JTZWVkICk7XG4iCiIgICAgZmxvYXQgZGlzdG9ydGVkQW5nbGUgPSBhbmdsZSAqIHRlbnRhY2xlQ291bnQgKyAoc21vb3RoTm9pc2UodmVjMihyYWRpdXMgKiAxMC4wLCBibG9iU2VlZCApKS0wLjUpIDtcbiIKIiAgICBmbG9hdCB6b29tID0gKHJhZGl1cyAtIDIuMCAqIDEuNSwgMS4wKSArIChzbW9vdGhOb2lzZSh1diAqIDEuMCArIGJsb2JTZWVkICktMC41KSAqIDAuMiA7XG4iCiJcbiIKIiAgICBmbG9hdCBwYXJ0aWNsZVdhdmUgPSBzaW4oZGlzdG9ydGVkQW5nbGUgLSB6b29tICogMTUwLjAgKiAoc21vb3RoTm9pc2UodXYgKiAxMC4wICsgYmxvYlNlZWQgKyB0aW1lKSktMC41KSAqIGJsb2JTZWVkICsgMS4wO1xuIgoiICAgIGZsb2F0IGludGVuc2l0eSA9IDAuNSArIHBhcnRpY2xlV2F2ZSAqIGV4cCgtcmFkaXVzICogMi41KSAqIDAuNSogKChzbW9vdGhOb2lzZSh1diAqIDIuMCArIGJsb2JTZWVkICsgdGltZSkpLTAuNSk7XG4iCiJcbiIKIiAgICAvLyAqKkFQUExZIEhJR0gtRlJFUVVFTkNZIFBJWEVMIE5PSVNFKipcbiIKIiAgICBmbG9hdCBwaXhlbE5vaXNlID0gcmFuZG9tKHV2ICogaVJlc29sdXRpb24ueHkpICogMC43OyAvLyBBZGp1c3Qgbm9pc2Ugc3RyZW5ndGhcbiIKIlxuIgoiICAgIHZlYzMgY29sb3IgPSBtaXgoY29sb3JBLCBjb2xvckIsIGludGVuc2l0eSk7XG4iCiIgICAgY29sb3IgPSBtaXgoY29sb3IsIGNvbG9yQywgc21vb3RoTm9pc2UodXYgKiAxNTAuMCAqIGJsb2JTZWVkICogc2luKCh0aW1lK2Jsb2JTZWVkKS9ibG9iU2VlZC8oMTAuMCkpICAgKyA0LjAgKyBibG9iU2VlZC8xMDAuMCkpO1xuIgoiICAgIGNvbG9yICs9IHBpeGVsTm9pc2UqYmxvYlNlZWQqc2luKHRpbWUvYmxvYlNlZWQrYmxvYlNlZWQrMTU4OS4wKS8xMDAuMDsgLy8gQWRkIHBpeGVsIG5vaXNlIGxheWVyXG4iCiJcbiIKIiAgICBmcmFnQ29sb3IgPSB2ZWM0KGNvbG9yICogaW50ZW5zaXR5LCBibG9iU2VlZC8xMDAuMCk7XG4iCiJ9XG4iCiJcbiIKInZvaWQgbWFpbigpIHtcbiIKIiAgICBtYWluSW1hZ2Uob3V0cHV0Q29sb3IsIGdsX0ZyYWdDb29yZC54eSk7XG4iCiIgICAgb3V0cHV0Q29sb3IuYSA9IDEuMDtcbiIKIn1cbiI7Cg==',validate=True)
+if hashlib.sha256(data).hexdigest()!='6d8abf902f95c92851dcb1e338c23b51eaef3c184a90e0d17bff2861c3e3d1a9':
+    raise SystemExit('Embedded source checksum mismatch')
+with open(sys.argv[1],'wb') as f: f.write(data)
+PAYLOAD_PY
+python3 - "$stage/runner.py" <<'PAYLOAD_PY'
+import base64, hashlib, sys
+data=base64.b64decode('IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJEZWNvcmF0aXZlIG5hdGl2ZSB2aWV3ZXIuIE5ldmVyIGEgbG9jayBzY3JlZW4gb3IgYXV0aGVudGljYXRpb24gYm91bmRhcnkuIiIiCmltcG9ydCBmY250bAppbXBvcnQgb3MKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCBzZWxlY3RvcnMKaW1wb3J0IHNobGV4CmltcG9ydCBzaHV0aWwKaW1wb3J0IHNpZ25hbAppbXBvcnQgc29ja2V0CmltcG9ydCBzdGF0CmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKaW1wb3J0IHRpbWUKClZJRVdFUiA9IFBhdGgoX19maWxlX18pLndpdGhfbmFtZSgnbWFsYWNoaXRlLW9wYWwtdmlld2VyJykucmVzb2x2ZSgpCk1BWF9ESVNQTEFZX1NFQ09ORFMgPSA2MAoKCmRlZiBydW50aW1lX2RpcigpOgogICAgYmFzZSA9IFBhdGgob3MuZW52aXJvbi5nZXQoJ1hER19SVU5USU1FX0RJUicsICcnKSkKICAgIGlmIG5vdCBiYXNlLmlzX2Fic29sdXRlKCk6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCdBIGRlc2t0b3AgWERHX1JVTlRJTUVfRElSIGlzIHJlcXVpcmVkLicpCiAgICBpbmZvID0gYmFzZS5sc3RhdCgpCiAgICBpZiBub3Qgc3RhdC5TX0lTRElSKGluZm8uc3RfbW9kZSkgb3IgaW5mby5zdF91aWQgIT0gb3MuZ2V0dWlkKCkgb3IgaW5mby5zdF9tb2RlICYgMG8wNzc6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCdYREdfUlVOVElNRV9ESVIgbXVzdCBiZSBhIHByaXZhdGUgZGlyZWN0b3J5IG93bmVkIGJ5IHlvdS4nKQogICAgZm9sZGVyID0gYmFzZSAvICdtYWxhY2hpdGUtb3BhbCcKICAgIGZvbGRlci5ta2Rpcihtb2RlPTBvNzAwLCBleGlzdF9vaz1UcnVlKQogICAgaW5mbyA9IGZvbGRlci5sc3RhdCgpCiAgICBpZiBub3Qgc3RhdC5TX0lTRElSKGluZm8uc3RfbW9kZSkgb3IgaW5mby5zdF91aWQgIT0gb3MuZ2V0dWlkKCkgb3IgaW5mby5zdF9tb2RlICYgMG8wNzc6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCdVbnNhZmUgcnVudGltZSBkaXJlY3RvcnkuJykKICAgIHJldHVybiBmb2xkZXIKCgpkZWYgdmlld2VyX2NvbW1hbmQoKToKICAgIGlmIG5vdCBWSUVXRVIuaXNfZmlsZSgpIG9yIG5vdCBvcy5hY2Nlc3MoVklFV0VSLCBvcy5YX09LKToKICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoJ05hdGl2ZSB2aWV3ZXIgbWlzc2luZzsgcmVydW4gdGhlIGluc3RhbGxlci4nKQogICAgcmV0dXJuIFtzdHIoVklFV0VSKV0KCgpjbGFzcyBWaWV3ZXI6CiAgICBkZWYgX19pbml0X18oc2VsZik6CiAgICAgICAgc2VsZi5wcm9jZXNzID0gTm9uZQogICAgICAgIHNlbGYuc3RhcnRlZCA9IDAKCiAgICBkZWYgc3RhcnQoc2VsZik6CiAgICAgICAgaWYgc2VsZi5wcm9jZXNzIGlzIG5vdCBOb25lOgogICAgICAgICAgICByZXR1cm4gICMgUmVwZWF0ZWQgaWRsZSBldmVudHMgbXVzdCBub3Qgc3Bhd24gYWRkaXRpb25hbCB2aWV3ZXJzLgogICAgICAgIHJ1bnRpbWVfZGlyKCkgICMgVmFsaWRhdGUgZGVza3RvcCBzZXNzaW9uIG93bmVyc2hpcCBiZWZvcmUgbGF1bmNoaW5nLgogICAgICAgIHNlbGYucHJvY2VzcyA9IHN1YnByb2Nlc3MuUG9wZW4odmlld2VyX2NvbW1hbmQoKSwgc3RhcnRfbmV3X3Nlc3Npb249VHJ1ZSkKICAgICAgICBzZWxmLnN0YXJ0ZWQgPSB0aW1lLm1vbm90b25pYygpCgogICAgZGVmIGV4aXRlZChzZWxmKToKICAgICAgICAjIERvIG5vdCByZWFwIHRoZSBsZWFkZXIgYmVmb3JlIGdyb3VwIGNsZWFudXA6IGl0cyByZXNlcnZlZCBQSUQgcHJldmVudHMKICAgICAgICAjIGFuIHVucmVsYXRlZCBwcm9jZXNzIGdyb3VwIGZyb20gcmV1c2luZyB0aGUgSUQgYWZ0ZXIgYSB3cmFwcGVyIGV4aXRzLgogICAgICAgIHJldHVybiBvcy53YWl0aWQob3MuUF9QSUQsIHNlbGYucHJvY2Vzcy5waWQsCiAgICAgICAgICAgICAgICAgICAgICAgICBvcy5XRVhJVEVEIHwgb3MuV05PSEFORyB8IG9zLldOT1dBSVQpIGlzIG5vdCBOb25lCgogICAgZGVmIHN0b3Aoc2VsZik6CiAgICAgICAgcHJvY2Vzcywgc2VsZi5wcm9jZXNzID0gc2VsZi5wcm9jZXNzLCBOb25lCiAgICAgICAgaWYgcHJvY2VzcyBpcyBub3QgTm9uZToKICAgICAgICAgICAgIyBUaGUgbGVhZGVyIGlzIHN0aWxsIG91ciB1bnJlYXBlZCBjaGlsZCwgZXZlbiBpZiBhIHdyYXBwZXIgZXhpdGVkLgogICAgICAgICAgICAjIEFsd2F5cyBjbGVhbiB0aGUgZ3JvdXAsIGluY2x1ZGluZyBjaGlsZHJlbiB0aGF0IGlnbm9yZWQgU0lHVEVSTS4KICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgb3Mua2lsbHBnKHByb2Nlc3MucGlkLCBzaWduYWwuU0lHVEVSTSkKICAgICAgICAgICAgZXhjZXB0IFByb2Nlc3NMb29rdXBFcnJvcjoKICAgICAgICAgICAgICAgIHBhc3MKICAgICAgICAgICAgdGltZS5zbGVlcCgwLjIpCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIG9zLmtpbGxwZyhwcm9jZXNzLnBpZCwgc2lnbmFsLlNJR0tJTEwpCiAgICAgICAgICAgIGV4Y2VwdCBQcm9jZXNzTG9va3VwRXJyb3I6CiAgICAgICAgICAgICAgICBwYXNzCiAgICAgICAgICAgIHByb2Nlc3Mud2FpdCgpCgogICAgZGVmIHRpY2soc2VsZik6CiAgICAgICAgaWYgc2VsZi5wcm9jZXNzIGlzIG5vdCBOb25lOgogICAgICAgICAgICBpZiBzZWxmLmV4aXRlZCgpOgogICAgICAgICAgICAgICAgcHJvY2VzcyA9IHNlbGYucHJvY2VzcwogICAgICAgICAgICAgICAgc2VsZi5zdG9wKCkKICAgICAgICAgICAgICAgIGlmIHByb2Nlc3MucmV0dXJuY29kZToKICAgICAgICAgICAgICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoZidOYXRpdmUgdmlld2VyIGV4aXRlZCAoe3Byb2Nlc3MucmV0dXJuY29kZX0pOyBjaGVjayBpdHMgR0wgZGlhZ25vc3RpY3MgYWJvdmUuJykKICAgICAgICAgICAgZWxpZiB0aW1lLm1vbm90b25pYygpIC0gc2VsZi5zdGFydGVkID49IE1BWF9ESVNQTEFZX1NFQ09ORFM6CiAgICAgICAgICAgICAgICBzZWxmLnN0b3AoKQoKCmRlZiBzZW5kKGFjdGlvbik6CiAgICB3aXRoIHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX1VOSVgsIHNvY2tldC5TT0NLX1NUUkVBTSkgYXMgY2xpZW50OgogICAgICAgIGNsaWVudC5zZXR0aW1lb3V0KDIpCiAgICAgICAgdHJ5OgogICAgICAgICAgICBjbGllbnQuY29ubmVjdChzdHIocnVudGltZV9kaXIoKSAvICdjb250cm9sLnNvY2snKSkKICAgICAgICBleGNlcHQgKEZpbGVOb3RGb3VuZEVycm9yLCBDb25uZWN0aW9uUmVmdXNlZEVycm9yKToKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgY2xpZW50LnNlbmRhbGwoYWN0aW9uLmVuY29kZSgnYXNjaWknKSkKCgpkZWYgZGFlbW9uKCk6CiAgICB3YXlsYW5kID0gYm9vbChvcy5lbnZpcm9uLmdldCgnV0FZTEFORF9ESVNQTEFZJykpCiAgICBpZiBub3Qgd2F5bGFuZCBhbmQgbm90IG9zLmVudmlyb24uZ2V0KCdESVNQTEFZJyk6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCdBIFdheWxhbmQgb3IgWDExIGRlc2t0b3Agc2Vzc2lvbiBpcyByZXF1aXJlZC4nKQogICAgZXhlY3V0YWJsZSA9IHNodXRpbC53aGljaCgnc3dheWlkbGUnIGlmIHdheWxhbmQgZWxzZSAneHByaW50aWRsZScpCiAgICBpZiBub3QgZXhlY3V0YWJsZToKICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoJ0luc3RhbGwgc3dheWlkbGUgKFdheWxhbmQpIG9yIHhwcmludGlkbGUgKFgxMSkuJykKICAgIHNlY29uZHMgPSBpbnQoUGF0aChfX2ZpbGVfXykud2l0aF9uYW1lKCd0aW1lb3V0JykucmVhZF90ZXh0KCkuc3RyaXAoKSkKICAgIGlmIG5vdCAxMCA8PSBzZWNvbmRzIDw9IDg2NDAwOgogICAgICAgIHJhaXNlIFJ1bnRpbWVFcnJvcignSW52YWxpZCB0aW1lb3V0LicpCiAgICBmb2xkZXIgPSBydW50aW1lX2RpcigpCiAgICAjIGZsb2NrIHByZXZlbnRzIHR3byBzdXBlcnZpc29ycyBmcm9tIHNoYXJpbmcgY2FsbGJhY2tzIG9yIHZpZXdlciBzdGF0ZS4KICAgIHdpdGggb3Blbihmb2xkZXIgLyAnZGFlbW9uLmxvY2snLCAnYScpIGFzIGxvY2s6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBmY250bC5mbG9jayhsb2NrLCBmY250bC5MT0NLX0VYIHwgZmNudGwuTE9DS19OQikKICAgICAgICBleGNlcHQgQmxvY2tpbmdJT0Vycm9yOgogICAgICAgICAgICByZXR1cm4KICAgICAgICBzb2NrcGF0aCA9IGZvbGRlciAvICdjb250cm9sLnNvY2snCiAgICAgICAgc29ja3BhdGgudW5saW5rKG1pc3Npbmdfb2s9VHJ1ZSkKICAgICAgICB2aWV3ZXIgPSBWaWV3ZXIoKQogICAgICAgIGFsaXZlID0gVHJ1ZQogICAgICAgIGRlZiBzaHV0ZG93bigqXyk6CiAgICAgICAgICAgIG5vbmxvY2FsIGFsaXZlCiAgICAgICAgICAgIGFsaXZlID0gRmFsc2UKICAgICAgICBzaWduYWwuc2lnbmFsKHNpZ25hbC5TSUdURVJNLCBzaHV0ZG93bikKICAgICAgICBzaWduYWwuc2lnbmFsKHNpZ25hbC5TSUdJTlQsIHNodXRkb3duKQogICAgICAgIHByZWZpeCA9IHNobGV4LmpvaW4oW3N5cy5leGVjdXRhYmxlLCBzdHIoUGF0aChfX2ZpbGVfXykucmVzb2x2ZSgpKV0pCiAgICAgICAgd2l0aCBzb2NrZXQuc29ja2V0KHNvY2tldC5BRl9VTklYLCBzb2NrZXQuU09DS19TVFJFQU0pIGFzIHNlcnZlciwgc2VsZWN0b3JzLkRlZmF1bHRTZWxlY3RvcigpIGFzIHNlbGVjdG9yOgogICAgICAgICAgICBzZXJ2ZXIuYmluZChzdHIoc29ja3BhdGgpKQogICAgICAgICAgICBvcy5jaG1vZChzb2NrcGF0aCwgMG82MDApCiAgICAgICAgICAgIHNlcnZlci5saXN0ZW4oNCkKICAgICAgICAgICAgc2VsZWN0b3IucmVnaXN0ZXIoc2VydmVyLCBzZWxlY3RvcnMuRVZFTlRfUkVBRCkKICAgICAgICAgICAgIyBJZ25vcmUgdGhlIHVzZXIncyB1bnJlbGF0ZWQgc3dheWlkbGUgY29uZmlndXJhdGlvbi4gTm8gLXc6IGNhbGxiYWNrcwogICAgICAgICAgICAjIG11c3Qgbm90IGJsb2NrIGRpc3BhdGNoIG9mIHRoZSByZXN1bWUgZXZlbnQuCiAgICAgICAgICAgIGlkbGUgPSBzdWJwcm9jZXNzLlBvcGVuKFtleGVjdXRhYmxlLCAnLUMnLCAnL2Rldi9udWxsJywgJ3RpbWVvdXQnLCBzdHIoc2Vjb25kcyksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBwcmVmaXggKyAnIHN0YXJ0JywgJ3Jlc3VtZScsIHByZWZpeCArICcgc3RvcCcsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAnYmVmb3JlLXNsZWVwJywgcHJlZml4ICsgJyBzdG9wJywgJ2xvY2snLCBwcmVmaXggKyAnIHN0b3AnXSkgaWYgd2F5bGFuZCBlbHNlIE5vbmUKICAgICAgICAgICAgd2FzX2lkbGUgPSBGYWxzZQogICAgICAgICAgICBwcmV2aW91c19pZGxlID0gMAogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICB3aGlsZSBhbGl2ZToKICAgICAgICAgICAgICAgICAgICBpZiBpZGxlIGlzIG5vdCBOb25lOgogICAgICAgICAgICAgICAgICAgICAgICBzdGF0dXMgPSBpZGxlLnBvbGwoKQogICAgICAgICAgICAgICAgICAgICAgICBpZiBzdGF0dXMgaXMgbm90IE5vbmU6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoZidzd2F5aWRsZSBleGl0ZWQgKHtzdGF0dXN9KTsgY29tcG9zaXRvci9wcm90b2NvbCBzdXBwb3J0IG11c3QgYmUgY2hlY2tlZC4nKQogICAgICAgICAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICAgICAgICAgIHJlc3VsdCA9IHN1YnByb2Nlc3MucnVuKFtleGVjdXRhYmxlXSwgY2hlY2s9VHJ1ZSwgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlLCB0aW1lb3V0PTIpCiAgICAgICAgICAgICAgICAgICAgICAgIGN1cnJlbnRfaWRsZSA9IGludChyZXN1bHQuc3Rkb3V0LnN0cmlwKCkpCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIGN1cnJlbnRfaWRsZSA8IHByZXZpb3VzX2lkbGU6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICB2aWV3ZXIuc3RvcCgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB3YXNfaWRsZSA9IEZhbHNlCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIGN1cnJlbnRfaWRsZSA+PSBzZWNvbmRzICogMTAwMCBhbmQgbm90IHdhc19pZGxlOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgdmlld2VyLnN0YXJ0KCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHdhc19pZGxlID0gVHJ1ZQogICAgICAgICAgICAgICAgICAgICAgICBwcmV2aW91c19pZGxlID0gY3VycmVudF9pZGxlCiAgICAgICAgICAgICAgICAgICAgZm9yIF8sIF8gaW4gc2VsZWN0b3Iuc2VsZWN0KHRpbWVvdXQ9MC41KToKICAgICAgICAgICAgICAgICAgICAgICAgd2l0aCBzZXJ2ZXIuYWNjZXB0KClbMF0gYXMgY2xpZW50OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgY2xpZW50LnNldHRpbWVvdXQoMC4yKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGFjdGlvbiA9IGNsaWVudC5yZWN2KDE2KQogICAgICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IHNvY2tldC50aW1lb3V0OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBhY3Rpb24gPT0gYidzdGFydCc6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdmlld2VyLnN0YXJ0KCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGVsaWYgYWN0aW9uID09IGInc3RvcCc6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdmlld2VyLnN0b3AoKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgZWxpZiBhY3Rpb24gPT0gYidxdWl0JzoKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBhbGl2ZSA9IEZhbHNlCiAgICAgICAgICAgICAgICAgICAgdmlld2VyLnRpY2soKQogICAgICAgICAgICBmaW5hbGx5OgogICAgICAgICAgICAgICAgdmlld2VyLnN0b3AoKQogICAgICAgICAgICAgICAgaWYgaWRsZSBpcyBub3QgTm9uZSBhbmQgaWRsZS5wb2xsKCkgaXMgTm9uZToKICAgICAgICAgICAgICAgICAgICBpZGxlLnRlcm1pbmF0ZSgpCiAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICBpZGxlLndhaXQodGltZW91dD0zKQogICAgICAgICAgICAgICAgICAgIGV4Y2VwdCBzdWJwcm9jZXNzLlRpbWVvdXRFeHBpcmVkOgogICAgICAgICAgICAgICAgICAgICAgICBpZGxlLmtpbGwoKQogICAgICAgICAgICAgICAgICAgICAgICBpZGxlLndhaXQoKQogICAgICAgICAgICAgICAgc29ja3BhdGgudW5saW5rKG1pc3Npbmdfb2s9VHJ1ZSkKCgpkZWYgbWFpbigpOgogICAgaWYgb3MuZ2V0ZXVpZCgpID09IDA6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCdEbyBub3QgcnVuIHRoZSBhcnR3b3JrIHZpZXdlciBhcyByb290LicpCiAgICBhY3Rpb24gPSBzeXMuYXJndlsxXSBpZiBsZW4oc3lzLmFyZ3YpID09IDIgZWxzZSAnaGVscCcKICAgIGlmIGFjdGlvbiBpbiAoJ3N0YXJ0JywgJ3N0b3AnLCAncXVpdCcpOgogICAgICAgIHNlbmQoYWN0aW9uKQogICAgZWxpZiBhY3Rpb24gPT0gJ2RhZW1vbic6CiAgICAgICAgZGFlbW9uKCkKICAgIGVsaWYgYWN0aW9uID09ICdwcmV2aWV3JzoKICAgICAgICB2aWV3ZXIgPSBWaWV3ZXIoKQogICAgICAgIGRlZiBpbnRlcnJ1cHRlZCgqXyk6CiAgICAgICAgICAgIHJhaXNlIEtleWJvYXJkSW50ZXJydXB0CiAgICAgICAgc2lnbmFsLnNpZ25hbChzaWduYWwuU0lHVEVSTSwgaW50ZXJydXB0ZWQpCiAgICAgICAgdHJ5OgogICAgICAgICAgICB2aWV3ZXIuc3RhcnQoKQogICAgICAgICAgICB3aGlsZSB2aWV3ZXIucHJvY2VzcyBpcyBub3QgTm9uZToKICAgICAgICAgICAgICAgIHRpbWUuc2xlZXAoMC4yKQogICAgICAgICAgICAgICAgdmlld2VyLnRpY2soKQogICAgICAgIGZpbmFsbHk6CiAgICAgICAgICAgIHZpZXdlci5zdG9wKCkKICAgIGVsc2U6CiAgICAgICAgcHJpbnQoJ1VzYWdlOiBydW5uZXIucHkge3ByZXZpZXd8ZGFlbW9ufHN0b3B8cXVpdH0nKQogICAgICAgIHJldHVybiAyCiAgICByZXR1cm4gMAoKCmlmIF9fbmFtZV9fID09ICdfX21haW5fXyc6CiAgICB0cnk6CiAgICAgICAgc3lzLmV4aXQobWFpbigpKQogICAgZXhjZXB0IEtleWJvYXJkSW50ZXJydXB0OgogICAgICAgIHN5cy5leGl0KDApCiAgICBleGNlcHQgKE9TRXJyb3IsIFZhbHVlRXJyb3IsIFJ1bnRpbWVFcnJvciwgc3VicHJvY2Vzcy5TdWJwcm9jZXNzRXJyb3IpIGFzIGVycm9yOgogICAgICAgIHByaW50KGYnTWFsYWNoaXRlIE9wYWw6IHtlcnJvcn0nLCBmaWxlPXN5cy5zdGRlcnIpCiAgICAgICAgc3lzLmV4aXQoMSkK',validate=True)
+if hashlib.sha256(data).hexdigest()!='8b8a14882bd4969696486d59da85d48abd79b3f2095d9029c0cd6901286ed39e':
+    raise SystemExit('Embedded source checksum mismatch')
+with open(sys.argv[1],'wb') as f: f.write(data)
+PAYLOAD_PY
+python3 - "$stage/ARTWORK-NOTICE.md" <<'PAYLOAD_PY'
+import base64, hashlib, sys
+data=base64.b64decode('IyBBcnR3b3JrIGF0dHJpYnV0aW9uCgoqKk1hbGFjaGl0ZSBPcGFsIGJ5IFJpY2NhcmRvIFN0ZWxsYSAoQWxjaGVtaXN0KSoqLgoKQnVuZGxlZCBhdCB0aGUgcmVwb3NpdG9yeSBvd25lcidzIGRpcmVjdGlvbiBmcm9tIHRoZWlyIGV4aXN0aW5nIGhvc3RlZCBjb3B5IGF0IGh0dHBzOi8vNTg5YXJjYWRlLmNvbS9hc3NldHMvYXJ0L3pvb21pbmcvaW5kZXguaHRtbCAocmV0cmlldmVkIDIwMjYtMTEtMTcpLiBSaWNjYXJkbyBjb25maXJtZWQgdGhhdCBoZSBpcyBBbGNoZW1pc3QgYW5kIGF1dGhvcml6ZWQgdGhpcyBidW5kbGVkIGNvcHkuIE9yaWdpbmFsIGFydGlzdCBhdHRyaWJ1dGlvbiBpcyBwcmVzZXJ2ZWQ7IHRoaXMgbm90aWNlIGRvZXMgbm90IGNoYW5nZSB0aGUgYXJ0d29yaydzIGxpY2Vuc2luZyB0ZXJtcy4KCk9mZmxpbmUgYWRhcHRhdGlvbiByZW1vdmVzIHRoZSBhcmNhZGUtd2FsbCBoZWxwZXIgKGEgbm8tb3Agd2hlbiBzdGFuZGFsb25lKSBhbmQgdGhlIEZYSGFzaCBTREsuIENhbGxzIHRvIGAkZngucmFuZCgpYCBhcmUgcmVwbGFjZWQgd2l0aCBgTWF0aC5yYW5kb20oKWAuIFRoZSB2aXN1YWwgYWxnb3JpdGhtIGFuZCBzaGFkZXIgYXJlIHJldGFpbmVkOyByYW5kb20gc2VlZCByZXByb2R1Y2liaWxpdHkgYW5kIG1pbnRlZCBGWEhhc2ggbWV0YWRhdGEgYXJlIG5vdC4gTm8gdGhpcmQtcGFydHkgRlhIYXNoIFNESyBjb2RlIGlzIGJ1bmRsZWQuCgpBIHJlc3RyaWN0aXZlIENvbnRlbnQgU2VjdXJpdHkgUG9saWN5IGRpc2FsbG93cyBuZXR3b3JrIGNvbm5lY3Rpb25zIGFuZCBleHRlcm5hbCBzY3JpcHRzL3Jlc291cmNlcy4gVGhpcyBjb3B5IGlzIHVwZGF0ZWQgdGhyb3VnaCByZXZpZXdlZCByZXBvc2l0b3J5IGNoYW5nZXMsIG5vdCBmZXRjaGVkIGF0IGFjdGl2YXRpb24uCg==',validate=True)
+if hashlib.sha256(data).hexdigest()!='30943d76280a4c7e6a041213ac1db740451d64a36ceb84f8403e2b3173e4ef3f':
+    raise SystemExit('Embedded source checksum mismatch')
+with open(sys.argv[1],'wb') as f: f.write(data)
+PAYLOAD_PY
+# Build before touching a working installation, and never run the renderer here.
+# shellcheck disable=SC2046
+cc -std=c11 -O2 -Wall -Wextra -Werror "$stage/viewer.c" -o "$stage/malachite-opal-viewer" $(pkg-config --cflags --libs gtk+-3.0 epoxy) -lm
+python3 - "$stage/runner.py" <<'PY'
 import ast, sys
-with open(sys.argv[1]) as source:
-    ast.parse(source.read())
+ast.parse(open(sys.argv[1]).read())
 PY
-chmod 700 "$stage"
-mv -- "$stage" "$DATA/runner.py"
-printf '%s\n' "$seconds" > "$DATA/timeout"
-# BEGIN GENERATED OFFLINE ARTWORK
-python3 - "$DATA/artwork.html" <<'ARTWORK_PY'
-import base64, hashlib, os, sys, tempfile
-data = base64.b64decode('CjwhRE9DVFlQRSBodG1sPgo8aHRtbCBsYW5nPSJlbiI+CjxoZWFkPgogICAgPG1ldGEgY2hhcnNldD0iVVRGLTgiPgogICAgPCEtLSBNYWxhY2hpdGUgT3BhbCBieSBSaWNjYXJkbyBTdGVsbGEgKEFsY2hlbWlzdCkuCiAgICAgICAgIEFkYXB0ZWQgZnJvbSB0aGUgYXV0aG9yJ3MgNTg5YXJjYWRlLmNvbSBjb3B5IGZvciBvZmZsaW5lIHNjcmVlbnNhdmVyIHVzZS4KICAgICAgICAgRlhIYXNoIHNlZWRpbmcgcmVwbGFjZWQgd2l0aCBNYXRoLnJhbmRvbTsgbm8gZXh0ZXJuYWwgU0RLIGlzIGJ1bmRsZWQuIC0tPgogICAgPG1ldGEgaHR0cC1lcXVpdj0iQ29udGVudC1TZWN1cml0eS1Qb2xpY3kiIGNvbnRlbnQ9ImRlZmF1bHQtc3JjICdub25lJzsgc2NyaXB0LXNyYyAndW5zYWZlLWlubGluZSc7IHN0eWxlLXNyYyAndW5zYWZlLWlubGluZSc7IGltZy1zcmMgZGF0YTo7IGNvbm5lY3Qtc3JjICdub25lJzsgb2JqZWN0LXNyYyAnbm9uZSc7IGJhc2UtdXJpICdub25lJzsgZm9ybS1hY3Rpb24gJ25vbmUnIj4KICAgIDxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MS4wIj4KICAgIDx0aXRsZT5NYWxhY2hpdGUgT3BhbDwvdGl0bGU+CiAgICA8c3R5bGU+CiAgICAgICAgYm9keSB7IG1hcmdpbjogMDsgb3ZlcmZsb3c6IGhpZGRlbjsgYmFja2dyb3VuZDogYmxhY2s7IH0KICAgICAgICBjYW52YXMgeyBkaXNwbGF5OiBibG9jazsgd2lkdGg6IDEwMHZ3OyBoZWlnaHQ6IDEwMHZoOyB9CiAgICA8L3N0eWxlPgo8L2hlYWQ+Cgo8Ym9keT4KICAgIDxjYW52YXMgaWQ9IndlYmdsLWNhbnZhcyI+PC9jYW52YXM+CgogICAgPHNjcmlwdD4KICAgICAgICAvLyBBZGp1c3QgY2FudmFzIHNpemUKCgogICAgICAgIC8vIEhTTCB0byBSR0IgY29udmVyc2lvbgogICAgICAgIGZ1bmN0aW9uIGhzbFRvUmdiKGgsIHMsIGwpIHsKICAgICAgICAgICAgaCAvPSAzNjA7CiAgICAgICAgICAgIGxldCByLCBnLCBiOwoKICAgICAgICAgICAgaWYgKHMgPT09IDApIHsKICAgICAgICAgICAgICAgIHIgPSBnID0gYiA9IGw7IC8vIEFjaHJvbWF0aWMKICAgICAgICAgICAgfSBlbHNlIHsKICAgICAgICAgICAgICAgIGNvbnN0IGh1ZTJyZ2IgPSAocCwgcSwgdCkgPT4gewogICAgICAgICAgICAgICAgICAgIGlmICh0IDwgMCkgdCArPSAxOwogICAgICAgICAgICAgICAgICAgIGlmICh0ID4gMSkgdCAtPSAxOwogICAgICAgICAgICAgICAgICAgIGlmICh0IDwgMSAvIDYpIHJldHVybiBwICsgKHEgLSBwKSAqIDYgKiB0OwogICAgICAgICAgICAgICAgICAgIGlmICh0IDwgMSAvIDIpIHJldHVybiBxOwogICAgICAgICAgICAgICAgICAgIGlmICh0IDwgMiAvIDMpIHJldHVybiBwICsgKHEgLSBwKSAqICgyIC8gMyAtIHQpICogNjsKICAgICAgICAgICAgICAgICAgICByZXR1cm4gcDsKICAgICAgICAgICAgICAgIH07CgogICAgICAgICAgICAgICAgY29uc3QgcSA9IGwgPCAwLjUgPyBsICogKDEgKyBzKSA6IGwgKyBzIC0gbCAqIHM7CiAgICAgICAgICAgICAgICBjb25zdCBwID0gMiAqIGwgLSBxOwogICAgICAgICAgICAgICAgciA9IGh1ZTJyZ2IocCwgcSwgaCArIDEgLyAzKTsKICAgICAgICAgICAgICAgIGcgPSBodWUycmdiKHAsIHEsIGgpOwogICAgICAgICAgICAgICAgYiA9IGh1ZTJyZ2IocCwgcSwgaCAtIDEgLyAzKTsKICAgICAgICAgICAgfQoKICAgICAgICAgICAgcmV0dXJuIFtyLCBnLCBiXTsKICAgICAgICB9CgogICAgICAgIC8vIEdlbmVyYXRlIFN0ZWxsYSBjb2xvcnMKICAgICAgICBmdW5jdGlvbiBnZW5lcmF0ZVN0ZWxsYUNvbG9ycygpIHsKICAgICAgICAgICAgY29uc3QgY2VudGVySHVlID0gTWF0aC5yYW5kb20oKSAqIDM2MDsgLy8gUmFuZG9tIGNlbnRlciBodWUKICAgICAgICAgICAgY29uc3QgcmFuZ2UgPSAzNjAgKiBNYXRoLnJhbmRvbSgpOyAvLyBSYW5nZSBvZiDCsTM2MMKwCiAgICAgICAgICAgIGNvbnN0IGh1ZXMgPSBbCiAgICAgICAgICAgICAgICBjZW50ZXJIdWUsCiAgICAgICAgICAgICAgICAoY2VudGVySHVlICsgcmFuZ2UpICUgMzYwLAogICAgICAgICAgICAgICAgKGNlbnRlckh1ZSAtIHJhbmdlICsgMzYwKSAlIDM2MAogICAgICAgICAgICBdOwoKICAgICAgICAgICAgLy8gQ29udmVydCBodWVzIHRvIFJHQgogICAgICAgICAgICByZXR1cm4gaHVlcy5tYXAoaCA9PiBoc2xUb1JnYihoLCAxLCAwLjUpKTsKICAgICAgICB9CgogICAgICAgIGNvbnN0IHZlcnRleFNoYWRlclNvdXJjZSA9IGAKICAgICAgICBhdHRyaWJ1dGUgdmVjNCBhX3Bvc2l0aW9uOwogICAgICAgIHZvaWQgbWFpbigpIHsKICAgICAgICAgICAgZ2xfUG9zaXRpb24gPSBhX3Bvc2l0aW9uOwogICAgICAgIH1gCiAgICAgICAgOwoKICAgICAgICBjb25zdCBmcmFnbWVudFNoYWRlclNvdXJjZSA9IGAKICAgICAgICNpZmRlZiBHTF9GUkFHTUVOVF9QUkVDSVNJT05fSElHSApwcmVjaXNpb24gaGlnaHAgZmxvYXQ7CiNlbHNlCnByZWNpc2lvbiBtZWRpdW1wIGZsb2F0OwojZW5kaWYKdW5pZm9ybSB2ZWMyIGlSZXNvbHV0aW9uOwp1bmlmb3JtIGZsb2F0IGlUaW1lOwp1bmlmb3JtIGZsb2F0IHRlbnRhY2xlQ291bnQ7CnVuaWZvcm0gZmxvYXQgYmxvYlNlZWQ7CnVuaWZvcm0gdmVjMyBjb2xvckE7CnVuaWZvcm0gdmVjMyBjb2xvckI7CnVuaWZvcm0gdmVjMyBjb2xvckM7CgpmbG9hdCByYW5kb20odmVjMiBzdCkgewogICAgcmV0dXJuIGZyYWN0KHNpbihkb3Qoc3QueHksIHZlYzIoMTIuOTg5OCwgNzguMjMzKSkpICogNDM3NTguNTQ1MzEyMyk7Cn0KCmZsb2F0IHNtb290aE5vaXNlKHZlYzIgc3QpIHsKICAgIHZlYzIgaSA9IGZsb29yKHN0KTsKICAgIHZlYzIgZiA9IGZyYWN0KHN0KTsKICAgIGYgPSBmICogZiAqICgzLjAgLSAyLjAgKiBmKTsKCiAgICBmbG9hdCBhID0gcmFuZG9tKGkpOwogICAgZmxvYXQgYiA9IHJhbmRvbShpICsgdmVjMigxLjAsIDAuMCkpOwogICAgZmxvYXQgYyA9IHJhbmRvbShpICsgdmVjMigwLjAsIDEuMCkpOwogICAgZmxvYXQgZCA9IHJhbmRvbShpICsgdmVjMigxLjAsIDEuMCkpOwoKICAgIHJldHVybiBtaXgobWl4KGEsIGIsIGYueCksIG1peChjLCBkLCBmLngpLCBmLnkpOwp9Cgp2b2lkIG1haW5JbWFnZShvdXQgdmVjNCBmcmFnQ29sb3IsIGluIHZlYzIgZnJhZ0Nvb3JkKSB7CiAgICBmbG9hdCB0aW1lID0gaVRpbWUgKiAwLjM7CnZlYzIgdXYgPSAoc2luKHRpbWUvYmxvYlNlZWQrMy4wKmJsb2JTZWVkKSsyLjApKigxMi4wKSAvIDEwMC4wICogKGZyYWdDb29yZCAtIGlSZXNvbHV0aW9uLnh5IC8gMi4wKSAvIGlSZXNvbHV0aW9uLnkgCiAgICAgICAgIC0gdmVjMihzbW9vdGhOb2lzZSh2ZWMyKHRpbWUgLyAxMC4wKzEwMDAuMCwgYmxvYlNlZWQpKSAtIDAuNSwgCiAgICAgICAgICAgICAgICBzbW9vdGhOb2lzZSh2ZWMyKHRpbWUgLyAxMC4wICsgYmxvYlNlZWQsIGJsb2JTZWVkICsgMTAwLjApKSAtIDAuNSk7Ci8vIENvbXB1dGUgZHluYW1pYyByb3RhdGlvbiBhbmdsZSB1c2luZyBzbW9vdGggbm9pc2UKZmxvYXQgdGhldGEgPSAzLjAqc21vb3RoTm9pc2UodmVjMih0aW1lL2Jsb2JTZWVkIC0gYmxvYlNlZWQsIGJsb2JTZWVkKSk7CgovLyAyRCBSb3RhdGlvbiBNYXRyaXgKbWF0MiByb3RNYXQgPSBtYXQyKAogICAgY29zKHRoZXRhKSwgLXNpbih0aGV0YSksCiAgICBzaW4odGhldGEpLCBjb3ModGhldGEpCik7CgovLyBBcHBseSByb3RhdGlvbiB0byBVViBjb29yZGluYXRlcwp1diAqPSByb3RNYXQ7CgoKICAgIC8vICoqUkFESUFMIE1FTFRJTkcgRUZGRUNUKioKICAgIGZsb2F0IG1lbHRTdHJlbmd0aCA9ICBzaW4odGltZS82LjArYmxvYlNlZWQpKjAuNSpibG9iU2VlZCAvMTAwLjA7IC8vIEFkanVzdCBmb3Igc3Ryb25nZXIgbWVsdGluZwogICAgZmxvYXQgbWVsdFNwZWVkID0gMC4xICogMTAwLjAgLzEwMC4wOyAvLyBDb250cm9scyBob3cgZmFzdCBpdCAiZHJpcHMiCiAgICAKICAgIC8vIE1ha2UgdGhlIGRpc3RvcnRpb24gKipyYWRpYXRlIGZyb20gdGhlIGNlbnRlcioqCnZlYzIgbWVsdE9mZnNldCA9IG5vcm1hbGl6ZSh1dikgKiAoc21vb3RoTm9pc2UodXYgKiAxMDAuMCArIG1lbHRTcGVlZCAqIDEwMC4wIC8gMTAwLjApLTAuNSkgKiBtZWx0U3RyZW5ndGg7CiAgICAKICAgIC8vIEFwcGx5IG1lbHRpbmcgZGlzdG9ydGlvbgogICAgdXYgKz0gbWVsdE9mZnNldDsKCiAgICBmbG9hdCBhbmdsZSA9IGF0YW4odXYueSwgdXYueCk7CiAgICBmbG9hdCByYWRpdXMgPSBsZW5ndGgodXYpICsgc21vb3RoTm9pc2UodXYgKiAxMC4wICsgYmxvYlNlZWQgKTsKICAgIGZsb2F0IGRpc3RvcnRlZEFuZ2xlID0gYW5nbGUgKiB0ZW50YWNsZUNvdW50ICsgKHNtb290aE5vaXNlKHZlYzIocmFkaXVzICogMTAuMCwgYmxvYlNlZWQgKSktMC41KSA7CiAgICBmbG9hdCB6b29tID0gKHJhZGl1cyAtIDIuMCAqIDEuNSwgMS4wKSArIChzbW9vdGhOb2lzZSh1diAqIDEuMCArIGJsb2JTZWVkICktMC41KSAqIDAuMiA7CgogICAgZmxvYXQgcGFydGljbGVXYXZlID0gc2luKGRpc3RvcnRlZEFuZ2xlIC0gem9vbSAqIDE1MC4wICogKHNtb290aE5vaXNlKHV2ICogMTAuMCArIGJsb2JTZWVkICsgdGltZSkpLTAuNSkgKiBibG9iU2VlZCArIDEuMDsKICAgIGZsb2F0IGludGVuc2l0eSA9IDAuNSArIHBhcnRpY2xlV2F2ZSAqIGV4cCgtcmFkaXVzICogMi41KSAqIDAuNSogKChzbW9vdGhOb2lzZSh1diAqIDIuMCArIGJsb2JTZWVkICsgdGltZSkpLTAuNSk7CgogICAgLy8gKipBUFBMWSBISUdILUZSRVFVRU5DWSBQSVhFTCBOT0lTRSoqCiAgICBmbG9hdCBwaXhlbE5vaXNlID0gcmFuZG9tKHV2ICogaVJlc29sdXRpb24ueHkpICogMC43OyAvLyBBZGp1c3Qgbm9pc2Ugc3RyZW5ndGgKCiAgICB2ZWMzIGNvbG9yID0gbWl4KGNvbG9yQSwgY29sb3JCLCBpbnRlbnNpdHkpOwogICAgY29sb3IgPSBtaXgoY29sb3IsIGNvbG9yQywgc21vb3RoTm9pc2UodXYgKiAxNTAuMCAqIGJsb2JTZWVkICogc2luKCh0aW1lK2Jsb2JTZWVkKS9ibG9iU2VlZC8oMTAuMCkpICAgKyA0LjAgKyBibG9iU2VlZC8xMDAuMCkpOwogICAgY29sb3IgKz0gcGl4ZWxOb2lzZSpibG9iU2VlZCpzaW4odGltZS9ibG9iU2VlZCtibG9iU2VlZCsxNTg5LjApLzEwMC4wOyAvLyBBZGQgcGl4ZWwgbm9pc2UgbGF5ZXIKCiAgICBmcmFnQ29sb3IgPSB2ZWM0KGNvbG9yICogaW50ZW5zaXR5LCBibG9iU2VlZC8xMDAuMCk7Cn0KCnZvaWQgbWFpbigpIHsKICAgIG1haW5JbWFnZShnbF9GcmFnQ29sb3IsIGdsX0ZyYWdDb29yZC54eSk7Cn1gCgoKICAgICAgICA7CgogICAgICAgIGZ1bmN0aW9uIGNyZWF0ZVNoYWRlcihnbCwgdHlwZSwgc291cmNlKSB7CiAgICAgICAgICAgIGNvbnN0IHNoYWRlciA9IGdsLmNyZWF0ZVNoYWRlcih0eXBlKTsKICAgICAgICAgICAgZ2wuc2hhZGVyU291cmNlKHNoYWRlciwgc291cmNlKTsKICAgICAgICAgICAgZ2wuY29tcGlsZVNoYWRlcihzaGFkZXIpOwogICAgICAgICAgICBpZiAoIWdsLmdldFNoYWRlclBhcmFtZXRlcihzaGFkZXIsIGdsLkNPTVBJTEVfU1RBVFVTKSkgewogICAgICAgICAgICAgICAgY29uc29sZS5lcnJvcigiU2hhZGVyIGNvbXBpbGUgZXJyb3I6IiwgZ2wuZ2V0U2hhZGVySW5mb0xvZyhzaGFkZXIpKTsKICAgICAgICAgICAgICAgIGdsLmRlbGV0ZVNoYWRlcihzaGFkZXIpOwogICAgICAgICAgICAgICAgcmV0dXJuIG51bGw7CiAgICAgICAgICAgIH0KICAgICAgICAgICAgcmV0dXJuIHNoYWRlcjsKICAgICAgICB9CgogICAgICAgIGZ1bmN0aW9uIGNyZWF0ZVByb2dyYW0oZ2wsIHZlcnRleFNoYWRlciwgZnJhZ21lbnRTaGFkZXIpIHsKICAgICAgICAgICAgY29uc3QgcHJvZ3JhbSA9IGdsLmNyZWF0ZVByb2dyYW0oKTsKICAgICAgICAgICAgZ2wuYXR0YWNoU2hhZGVyKHByb2dyYW0sIHZlcnRleFNoYWRlcik7CiAgICAgICAgICAgIGdsLmF0dGFjaFNoYWRlcihwcm9ncmFtLCBmcmFnbWVudFNoYWRlcik7CiAgICAgICAgICAgIGdsLmxpbmtQcm9ncmFtKHByb2dyYW0pOwogICAgICAgICAgICBpZiAoIWdsLmdldFByb2dyYW1QYXJhbWV0ZXIocHJvZ3JhbSwgZ2wuTElOS19TVEFUVVMpKSB7CiAgICAgICAgICAgICAgICBjb25zb2xlLmVycm9yKCJQcm9ncmFtIGxpbmsgZXJyb3I6IiwgZ2wuZ2V0UHJvZ3JhbUluZm9Mb2cocHJvZ3JhbSkpOwogICAgICAgICAgICAgICAgZ2wuZGVsZXRlUHJvZ3JhbShwcm9ncmFtKTsKICAgICAgICAgICAgICAgIHJldHVybiBudWxsOwogICAgICAgICAgICB9CiAgICAgICAgICAgIHJldHVybiBwcm9ncmFtOwogICAgICAgIH0KCiAgICAgICAgZnVuY3Rpb24gbWFpbigpIHsKICAgICAgICAgICAgY29uc3QgY2FudmFzID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoIndlYmdsLWNhbnZhcyIpOwogICAgICAgICAgICBjb25zdCBnbCA9IGNhbnZhcy5nZXRDb250ZXh0KCJ3ZWJnbCIpOwoKICAgICAgICAgICAgaWYgKCFnbCkgewogICAgICAgICAgICAgICAgdGhyb3cgbmV3IEVycm9yKCJXZWJHTCBpcyBub3QgYXZhaWxhYmxlIGZvciB0aGlzIGFydHdvcmsuIik7CiAgICAgICAgICAgIH0KICAgICAgICAgICAgd2luZG93LmFyY2FkZVdhbGxSdW50aW1lPy5yZWdpc3RlckNvbnRleHQoZ2wpOwoKICAgICAgICAgICAgLy9jYW52YXMud2lkdGggPSB3aW5kb3cuaW5uZXJXaWR0aDsKICAgICAgICAgICAgLy9jYW52YXMuaGVpZ2h0ID0gd2luZG93LmlubmVySGVpZ2h0OwogICAgICAgICAgICBnbC52aWV3cG9ydCgwLCAwLCBnbC5kcmF3aW5nQnVmZmVyV2lkdGgsIGdsLmRyYXdpbmdCdWZmZXJIZWlnaHQpOwoKICAgICAgICAgICAgY29uc3Qgc3RlbGxhQ29sb3JzID0gZ2VuZXJhdGVTdGVsbGFDb2xvcnMoKTsgLy8gR2VuZXJhdGUgY29sb3JzCgogICAgICAgICAgICBjb25zdCByYW5kb21UZW50YWNsZUNvdW50ID0gTWF0aC5mbG9vcihNYXRoLnJhbmRvbSgpICogMTEpICsgMjsKICAgICAgICAgICAgY29uc3QgcmFuZG9tQmxvYlNlZWQgPSBNYXRoLmZsb29yKE1hdGgucmFuZG9tKCkqOTApKzEwOwoKICAgICAgICAgICAgY29uc3QgdmVydGV4U2hhZGVyID0gY3JlYXRlU2hhZGVyKGdsLCBnbC5WRVJURVhfU0hBREVSLCB2ZXJ0ZXhTaGFkZXJTb3VyY2UpOwogICAgICAgICAgICBjb25zdCBmcmFnbWVudFNoYWRlciA9IGNyZWF0ZVNoYWRlcihnbCwgZ2wuRlJBR01FTlRfU0hBREVSLCBmcmFnbWVudFNoYWRlclNvdXJjZSk7CiAgICAgICAgICAgIGNvbnN0IHByb2dyYW0gPSBjcmVhdGVQcm9ncmFtKGdsLCB2ZXJ0ZXhTaGFkZXIsIGZyYWdtZW50U2hhZGVyKTsKICAgICAgICAgICAgZ2wudXNlUHJvZ3JhbShwcm9ncmFtKTsKCiAgICAgICAgICAgIGNvbnN0IHBvc2l0aW9uQnVmZmVyID0gZ2wuY3JlYXRlQnVmZmVyKCk7CiAgICAgICAgICAgIGdsLmJpbmRCdWZmZXIoZ2wuQVJSQVlfQlVGRkVSLCBwb3NpdGlvbkJ1ZmZlcik7CiAgICAgICAgICAgIGNvbnN0IHBvc2l0aW9ucyA9IFsKICAgICAgICAgICAgICAgIC0xLCAtMSwKICAgICAgICAgICAgICAgIDEsIC0xLAogICAgICAgICAgICAgICAgLTEsICAxLAogICAgICAgICAgICAgICAgLTEsICAxLAogICAgICAgICAgICAgICAgMSwgLTEsCiAgICAgICAgICAgICAgICAxLCAgMQogICAgICAgICAgICBdOwogICAgICAgICAgICBnbC5idWZmZXJEYXRhKGdsLkFSUkFZX0JVRkZFUiwgbmV3IEZsb2F0MzJBcnJheShwb3NpdGlvbnMpLCBnbC5TVEFUSUNfRFJBVyk7CgogICAgICAgICAgICBjb25zdCBwb3NpdGlvbkF0dHJpYnV0ZSA9IGdsLmdldEF0dHJpYkxvY2F0aW9uKHByb2dyYW0sICJhX3Bvc2l0aW9uIik7CiAgICAgICAgICAgIGdsLmVuYWJsZVZlcnRleEF0dHJpYkFycmF5KHBvc2l0aW9uQXR0cmlidXRlKTsKICAgICAgICAgICAgZ2wudmVydGV4QXR0cmliUG9pbnRlcihwb3NpdGlvbkF0dHJpYnV0ZSwgMiwgZ2wuRkxPQVQsIGZhbHNlLCAwLCAwKTsKCiAgICAgICAgICAgIGNvbnN0IGlSZXNvbHV0aW9uTG9jYXRpb24gPSBnbC5nZXRVbmlmb3JtTG9jYXRpb24ocHJvZ3JhbSwgImlSZXNvbHV0aW9uIik7CiAgICAgICAgICAgIGNvbnN0IGlUaW1lTG9jYXRpb24gPSBnbC5nZXRVbmlmb3JtTG9jYXRpb24ocHJvZ3JhbSwgImlUaW1lIik7CiAgICAgICAgICAgIGNvbnN0IHRlbnRhY2xlQ291bnRMb2NhdGlvbiA9IGdsLmdldFVuaWZvcm1Mb2NhdGlvbihwcm9ncmFtLCAidGVudGFjbGVDb3VudCIpOwogICAgICAgICAgICBjb25zdCBibG9iU2VlZExvY2F0aW9uID0gZ2wuZ2V0VW5pZm9ybUxvY2F0aW9uKHByb2dyYW0sICJibG9iU2VlZCIpOwogICAgICAgICAgICBjb25zdCBjb2xvckFMb2NhdGlvbiA9IGdsLmdldFVuaWZvcm1Mb2NhdGlvbihwcm9ncmFtLCAiY29sb3JBIik7CiAgICAgICAgICAgIGNvbnN0IGNvbG9yQkxvY2F0aW9uID0gZ2wuZ2V0VW5pZm9ybUxvY2F0aW9uKHByb2dyYW0sICJjb2xvckIiKTsKICAgICAgICAgICAgY29uc3QgY29sb3JDTG9jYXRpb24gPSBnbC5nZXRVbmlmb3JtTG9jYXRpb24ocHJvZ3JhbSwgImNvbG9yQyIpOwoKICAgICAgICAgICAgZ2wudW5pZm9ybTNmdihjb2xvckFMb2NhdGlvbiwgc3RlbGxhQ29sb3JzWzBdKTsKICAgICAgICAgICAgZ2wudW5pZm9ybTNmdihjb2xvckJMb2NhdGlvbiwgc3RlbGxhQ29sb3JzWzFdKTsKICAgICAgICAgICAgZ2wudW5pZm9ybTNmdihjb2xvckNMb2NhdGlvbiwgc3RlbGxhQ29sb3JzWzJdKTsKCiAgICAgICAgICAgIGZ1bmN0aW9uIHJlbmRlcih0aW1lKSB7CiAgICAgICAgICAgICAgICB0aW1lICo9IDAuMDAxOwogICAgICAgICAgICAgICAgZ2wudW5pZm9ybTJmKGlSZXNvbHV0aW9uTG9jYXRpb24sIGNhbnZhcy53aWR0aCwgY2FudmFzLmhlaWdodCk7CiAgICAgICAgICAgICAgICBnbC51bmlmb3JtMWYoaVRpbWVMb2NhdGlvbiwgdGltZSk7CiAgICAgICAgICAgICAgICBnbC51bmlmb3JtMWYodGVudGFjbGVDb3VudExvY2F0aW9uLCByYW5kb21UZW50YWNsZUNvdW50KTsKICAgICAgICAgICAgICAgIGdsLnVuaWZvcm0xZihibG9iU2VlZExvY2F0aW9uLCByYW5kb21CbG9iU2VlZCk7CiAgICAgICAgICAgICAgICBnbC5kcmF3QXJyYXlzKGdsLlRSSUFOR0xFUywgMCwgNik7CiAgICAgICAgICAgICAgICByZXF1ZXN0QW5pbWF0aW9uRnJhbWUocmVuZGVyKTsKICAgICAgICAgICAgfQoKICAgICAgICAgICAgcmVxdWVzdEFuaW1hdGlvbkZyYW1lKHJlbmRlcik7CiAgICAgICAgfQoKICAgICAgICB3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcigibG9hZCIsIG1haW4pOwogICAgICAgIGRvY3VtZW50LmFkZEV2ZW50TGlzdGVuZXIoImtleWRvd24iLCBmdW5jdGlvbiAoZXZlbnQpIHsKICAgIGlmIChldmVudC5rZXkgPT09ICJzIikgewogICAgICAgIHNhdmVDYW52YXNJbWFnZSgpOwogICAgfQp9KTsKCmZ1bmN0aW9uIHNhdmVDYW52YXNJbWFnZSgpIHsKICAgIGNvbnN0IGNhbnZhcyA9IGRvY3VtZW50LmdldEVsZW1lbnRCeUlkKCJ3ZWJnbC1jYW52YXMiKTsKICAgIGNvbnN0IGdsID0gY2FudmFzLmdldENvbnRleHQoIndlYmdsIik7CgogICAgLy8gQ3JlYXRlIGEgZnJhbWVidWZmZXIKICAgIGNvbnN0IGZyYW1lYnVmZmVyID0gZ2wuY3JlYXRlRnJhbWVidWZmZXIoKTsKICAgIGdsLmJpbmRGcmFtZWJ1ZmZlcihnbC5GUkFNRUJVRkZFUiwgZnJhbWVidWZmZXIpOwoKICAgIC8vIENyZWF0ZSBhIHRleHR1cmUgdG8gcmVuZGVyIGludG8KICAgIGNvbnN0IHRleHR1cmUgPSBnbC5jcmVhdGVUZXh0dXJlKCk7CiAgICBnbC5iaW5kVGV4dHVyZShnbC5URVhUVVJFXzJELCB0ZXh0dXJlKTsKICAgIGdsLnRleEltYWdlMkQoZ2wuVEVYVFVSRV8yRCwgMCwgZ2wuUkdCQSwgY2FudmFzLndpZHRoLCBjYW52YXMuaGVpZ2h0LCAwLCBnbC5SR0JBLCBnbC5VTlNJR05FRF9CWVRFLCBudWxsKTsKICAgIGdsLnRleFBhcmFtZXRlcmkoZ2wuVEVYVFVSRV8yRCwgZ2wuVEVYVFVSRV9NSU5fRklMVEVSLCBnbC5MSU5FQVIpOwogICAgZ2wudGV4UGFyYW1ldGVyaShnbC5URVhUVVJFXzJELCBnbC5URVhUVVJFX01BR19GSUxURVIsIGdsLkxJTkVBUik7CgogICAgLy8gQXR0YWNoIHRoZSB0ZXh0dXJlIHRvIHRoZSBmcmFtZWJ1ZmZlcgogICAgZ2wuZnJhbWVidWZmZXJUZXh0dXJlMkQoZ2wuRlJBTUVCVUZGRVIsIGdsLkNPTE9SX0FUVEFDSE1FTlQwLCBnbC5URVhUVVJFXzJELCB0ZXh0dXJlLCAwKTsKCiAgICAvLyBDcmVhdGUgYSByZW5kZXJidWZmZXIgZm9yIGRlcHRoCiAgICBjb25zdCByZW5kZXJidWZmZXIgPSBnbC5jcmVhdGVSZW5kZXJidWZmZXIoKTsKICAgIGdsLmJpbmRSZW5kZXJidWZmZXIoZ2wuUkVOREVSQlVGRkVSLCByZW5kZXJidWZmZXIpOwogICAgZ2wucmVuZGVyYnVmZmVyU3RvcmFnZShnbC5SRU5ERVJCVUZGRVIsIGdsLkRFUFRIX0NPTVBPTkVOVDE2LCBjYW52YXMud2lkdGgsIGNhbnZhcy5oZWlnaHQpOwogICAgZ2wuZnJhbWVidWZmZXJSZW5kZXJidWZmZXIoZ2wuRlJBTUVCVUZGRVIsIGdsLkRFUFRIX0FUVEFDSE1FTlQsIGdsLlJFTkRFUkJVRkZFUiwgcmVuZGVyYnVmZmVyKTsKCiAgICAvLyBDaGVjayBmcmFtZWJ1ZmZlciBzdGF0dXMKICAgIGlmIChnbC5jaGVja0ZyYW1lYnVmZmVyU3RhdHVzKGdsLkZSQU1FQlVGRkVSKSAhPT0gZ2wuRlJBTUVCVUZGRVJfQ09NUExFVEUpIHsKICAgICAgICBjb25zb2xlLmVycm9yKCJGcmFtZWJ1ZmZlciBpcyBub3QgY29tcGxldGUuIik7CiAgICAgICAgcmV0dXJuOwogICAgfQoKICAgIC8vIFJlbmRlciB0byBmcmFtZWJ1ZmZlcgogICAgZ2wuY2xlYXIoZ2wuQ09MT1JfQlVGRkVSX0JJVCB8IGdsLkRFUFRIX0JVRkZFUl9CSVQpOwogICAgZ2wuZHJhd0FycmF5cyhnbC5UUklBTkdMRVMsIDAsIDYpOwoKICAgIC8vIFJlYWQgcGl4ZWxzCiAgICBjb25zdCBwaXhlbHMgPSBuZXcgVWludDhBcnJheShjYW52YXMud2lkdGggKiBjYW52YXMuaGVpZ2h0ICogNCk7CiAgICBnbC5yZWFkUGl4ZWxzKDAsIDAsIGNhbnZhcy53aWR0aCwgY2FudmFzLmhlaWdodCwgZ2wuUkdCQSwgZ2wuVU5TSUdORURfQllURSwgcGl4ZWxzKTsKCiAgICAvLyBSZXN0b3JlIGRlZmF1bHQgZnJhbWVidWZmZXIKICAgIGdsLmJpbmRGcmFtZWJ1ZmZlcihnbC5GUkFNRUJVRkZFUiwgbnVsbCk7CgogICAgLy8gRmxpcCBpbWFnZSB2ZXJ0aWNhbGx5IChXZWJHTCBzdG9yZXMgcGl4ZWxzIGJvdHRvbS11cCkKICAgIGNvbnN0IGZsaXBwZWRQaXhlbHMgPSBuZXcgVWludDhBcnJheShjYW52YXMud2lkdGggKiBjYW52YXMuaGVpZ2h0ICogNCk7CiAgICBmb3IgKGxldCByb3cgPSAwOyByb3cgPCBjYW52YXMuaGVpZ2h0OyByb3crKykgewogICAgICAgIGNvbnN0IHNyY1N0YXJ0ID0gcm93ICogY2FudmFzLndpZHRoICogNDsKICAgICAgICBjb25zdCBkZXN0U3RhcnQgPSAoY2FudmFzLmhlaWdodCAtIHJvdyAtIDEpICogY2FudmFzLndpZHRoICogNDsKICAgICAgICBmbGlwcGVkUGl4ZWxzLnNldChwaXhlbHMuc3ViYXJyYXkoc3JjU3RhcnQsIHNyY1N0YXJ0ICsgY2FudmFzLndpZHRoICogNCksIGRlc3RTdGFydCk7CiAgICB9CgogICAgLy8gQ3JlYXRlIGFuIG9mZnNjcmVlbiBjYW52YXMgdG8gc3RvcmUgdGhlIGltYWdlCiAgICBjb25zdCBvZmZzY3JlZW5DYW52YXMgPSBkb2N1bWVudC5jcmVhdGVFbGVtZW50KCJjYW52YXMiKTsKICAgIG9mZnNjcmVlbkNhbnZhcy53aWR0aCA9IGNhbnZhcy53aWR0aDsKICAgIG9mZnNjcmVlbkNhbnZhcy5oZWlnaHQgPSBjYW52YXMuaGVpZ2h0OwogICAgY29uc3QgY3R4ID0gb2Zmc2NyZWVuQ2FudmFzLmdldENvbnRleHQoIjJkIik7CgogICAgLy8gQ3JlYXRlIEltYWdlRGF0YSBhbmQgcHV0IGl0IG9uIHRoZSBvZmZzY3JlZW4gY2FudmFzCiAgICBjb25zdCBpbWFnZURhdGEgPSBuZXcgSW1hZ2VEYXRhKG5ldyBVaW50OENsYW1wZWRBcnJheShmbGlwcGVkUGl4ZWxzKSwgY2FudmFzLndpZHRoLCBjYW52YXMuaGVpZ2h0KTsKICAgIGN0eC5wdXRJbWFnZURhdGEoaW1hZ2VEYXRhLCAwLCAwKTsKCiAgICAvLyBDcmVhdGUgZG93bmxvYWQgbGluawogICAgY29uc3QgbGluayA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoImEiKTsKICAgIGxpbmsuaHJlZiA9IG9mZnNjcmVlbkNhbnZhcy50b0RhdGFVUkwoImltYWdlL3BuZyIpOwogICAgbGluay5kb3dubG9hZCA9ICJtYWxhY2hpdGVPcGFsLnBuZyI7CiAgICBkb2N1bWVudC5ib2R5LmFwcGVuZENoaWxkKGxpbmspOwogICAgbGluay5jbGljaygpOwogICAgZG9jdW1lbnQuYm9keS5yZW1vdmVDaGlsZChsaW5rKTsKCiAgICAvLyBDbGVhbnVwIFdlYkdMIHJlc291cmNlcwogICAgZ2wuZGVsZXRlRnJhbWVidWZmZXIoZnJhbWVidWZmZXIpOwogICAgZ2wuZGVsZXRlVGV4dHVyZSh0ZXh0dXJlKTsKICAgIGdsLmRlbGV0ZVJlbmRlcmJ1ZmZlcihyZW5kZXJidWZmZXIpOwp9CndpbmRvdy5hZGRFdmVudExpc3RlbmVyKCJyZXNpemUiLCAoKSA9PiB7CiAgICBpbml0KCk7Cn0pOwpmdW5jdGlvbiBpbml0KCl7CiAgICBjb25zdCBjYW52YXMgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgid2ViZ2wtY2FudmFzIik7CiAgICBjb25zdCBnbCA9IGNhbnZhcy5nZXRDb250ZXh0KCJ3ZWJnbCIpOwogICAgaWYgKCFnbCkgdGhyb3cgbmV3IEVycm9yKCJXZWJHTCBpcyBub3QgYXZhaWxhYmxlIGZvciB0aGlzIGFydHdvcmsuIik7CgogICAgLy8gVXBkYXRlIGNhbnZhcyBzaXplCiAgICBjYW52YXMud2lkdGggPSB3aW5kb3cuaW5uZXJXaWR0aDsKICAgIGNhbnZhcy5oZWlnaHQgPSB3aW5kb3cuaW5uZXJIZWlnaHQ7CgogICAgLy8gVXBkYXRlIFdlYkdMIHZpZXdwb3J0CiAgICBnbC52aWV3cG9ydCgwLCAwLCBjYW52YXMud2lkdGgsIGNhbnZhcy5oZWlnaHQpOwoKICAgIC8vIFRoZSByZW5kZXIgbG9vcCB1cGRhdGVzIGlSZXNvbHV0aW9uIGFmdGVyIHRoZSBzaGFkZXIgcHJvZ3JhbSBpcyByZWFkeS4KfQppbml0KCk7CiAgICA8L3NjcmlwdD4KPC9ib2R5Pgo8L2h0bWw+Cg==', validate=True)
-if hashlib.sha256(data).hexdigest() != '48ac42b0f8ad0163fe4333582ab098279e303959319da0204c6491bb94064086':
-    raise SystemExit('Embedded artwork checksum mismatch')
-fd, stage = tempfile.mkstemp(dir=os.path.dirname(sys.argv[1]))
-try:
-    with os.fdopen(fd, 'wb') as output:
-        output.write(data)
-    os.replace(stage, sys.argv[1])
-finally:
-    if os.path.exists(stage): os.unlink(stage)
-ARTWORK_PY
-python3 - "$DATA/ARTWORK-NOTICE.md" <<'ARTWORK_PY'
-import base64, hashlib, os, sys, tempfile
-data = base64.b64decode('IyBBcnR3b3JrIGF0dHJpYnV0aW9uCgoqKk1hbGFjaGl0ZSBPcGFsIGJ5IFJpY2NhcmRvIFN0ZWxsYSAoQWxjaGVtaXN0KSoqLgoKQnVuZGxlZCBhdCB0aGUgcmVwb3NpdG9yeSBvd25lcidzIGRpcmVjdGlvbiBmcm9tIHRoZWlyIGV4aXN0aW5nIGhvc3RlZCBjb3B5IGF0IGh0dHBzOi8vNTg5YXJjYWRlLmNvbS9hc3NldHMvYXJ0L3pvb21pbmcvaW5kZXguaHRtbCAocmV0cmlldmVkIDIwMjYtMTEtMTcpLiBSaWNjYXJkbyBjb25maXJtZWQgdGhhdCBoZSBpcyBBbGNoZW1pc3QgYW5kIGF1dGhvcml6ZWQgdGhpcyBidW5kbGVkIGNvcHkuIE9yaWdpbmFsIGFydGlzdCBhdHRyaWJ1dGlvbiBpcyBwcmVzZXJ2ZWQ7IHRoaXMgbm90aWNlIGRvZXMgbm90IGNoYW5nZSB0aGUgYXJ0d29yaydzIGxpY2Vuc2luZyB0ZXJtcy4KCk9mZmxpbmUgYWRhcHRhdGlvbiByZW1vdmVzIHRoZSBhcmNhZGUtd2FsbCBoZWxwZXIgKGEgbm8tb3Agd2hlbiBzdGFuZGFsb25lKSBhbmQgdGhlIEZYSGFzaCBTREsuIENhbGxzIHRvIGAkZngucmFuZCgpYCBhcmUgcmVwbGFjZWQgd2l0aCBgTWF0aC5yYW5kb20oKWAuIFRoZSB2aXN1YWwgYWxnb3JpdGhtIGFuZCBzaGFkZXIgYXJlIHJldGFpbmVkOyByYW5kb20gc2VlZCByZXByb2R1Y2liaWxpdHkgYW5kIG1pbnRlZCBGWEhhc2ggbWV0YWRhdGEgYXJlIG5vdC4gTm8gdGhpcmQtcGFydHkgRlhIYXNoIFNESyBjb2RlIGlzIGJ1bmRsZWQuCgpBIHJlc3RyaWN0aXZlIENvbnRlbnQgU2VjdXJpdHkgUG9saWN5IGRpc2FsbG93cyBuZXR3b3JrIGNvbm5lY3Rpb25zIGFuZCBleHRlcm5hbCBzY3JpcHRzL3Jlc291cmNlcy4gVGhpcyBjb3B5IGlzIHVwZGF0ZWQgdGhyb3VnaCByZXZpZXdlZCByZXBvc2l0b3J5IGNoYW5nZXMsIG5vdCBmZXRjaGVkIGF0IGFjdGl2YXRpb24uCg==', validate=True)
-if hashlib.sha256(data).hexdigest() != '30943d76280a4c7e6a041213ac1db740451d64a36ceb84f8403e2b3173e4ef3f':
-    raise SystemExit('Embedded artwork checksum mismatch')
-fd, stage = tempfile.mkstemp(dir=os.path.dirname(sys.argv[1]))
-try:
-    with os.fdopen(fd, 'wb') as output:
-        output.write(data)
-    os.replace(stage, sys.argv[1])
-finally:
-    if os.path.exists(stage): os.unlink(stage)
-ARTWORK_PY
-# END GENERATED OFFLINE ARTWORK
-if ((autostart)); then
-  # Escape Desktop Entry Exec argument syntax without invoking a shell.
-  python3 - "$DATA/runner.py" "$AUTO" <<'PY'
-import os, sys, tempfile
-path, destination = sys.argv[1:]
-def quote(value):
-    value = value.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
-    # General desktop-entry escaping is decoded before Exec escaping.
-    return '"' + value.replace('\\', '\\\\') + '"'
-text = ('[Desktop Entry]\nType=Application\nName=Malachite Opal artwork\n'
-        'Comment=Decorative pre-lock artwork; does not replace screen locking\n'
-        'Exec=' + quote(sys.executable) + ' ' + quote(path) + ' daemon\n'
-        'OnlyShowIn=COSMIC;XFCE;MATE;LXDE;LXQt;\nTerminal=false\n')
-fd, stage = tempfile.mkstemp(dir=os.path.dirname(destination))
-try:
-    with os.fdopen(fd, 'w') as output:
-        output.write(text)
-    os.replace(stage, destination)
-finally:
-    if os.path.exists(stage): os.unlink(stage)
+chmod 700 "$stage/malachite-opal-viewer" "$stage/runner.py"
+printf '%s\n' "$seconds" > "$stage/timeout"
+# Stage a safely quoted desktop entry (including spaces and backslashes).
+python3 - "$DATA/runner.py" "$stage/autostart.desktop" <<'PY'
+import sys
+path=sys.argv[1]
+# Desktop Exec parsing has a second layer of backslash escaping.
+quoted='"'+path.replace('\\','\\\\\\\\').replace('"','\\\\"').replace('`','\\\\`').replace('$','\\\\$')+'"'
+open(sys.argv[2],'w').write('[Desktop Entry]\nType=Application\nName=Malachite Opal\nExec=python3 '+quoted+' daemon\nTerminal=false\nOnlyShowIn=COSMIC;XFCE;MATE;LXDE;LXQt;\n')
 PY
-else
-  rm -f -- "$AUTO"
-fi
-printf 'Installed. Preview: python3 %q preview\n' "$DATA/runner.py"
-printf 'Automatic mode: python3 %q daemon\n' "$DATA/runner.py"
-echo 'Autostart takes effect at the next supported desktop login (unless --no-autostart). Nothing has been launched now.'
-echo 'Existing native lock/blank/suspend settings are unchanged. Set artwork timeout shorter than native lock timeout if desired.'
-echo 'Artwork closes after at most 60 seconds. This is NOT a screen locker.'
-if [[ -f $HOME/malachite-opal-screensaver.sh ]]; then
-  echo 'Legacy installer detected: review its GNOME lock changes and XScreenSaver autostart manually. They were not reset or removed.'
-fi
+stop_old
+for name in "${files[@]}"; do
+  if [[ -f $DATA/$name ]]; then cp -p -- "$DATA/$name" "$DATA/$name.bak"; fi
+done
+if [[ -f $AUTO ]]; then cp -p -- "$AUTO" "$AUTO.bak"; fi
+for name in runner.py timeout malachite-opal-viewer ARTWORK-NOTICE.md; do mv -- "$stage/$name" "$DATA/$name"; done
+rm -f -- "$DATA/artwork.html"
+if ((autostart)); then mv -- "$stage/autostart.desktop" "$AUTO"; else rm -f -- "$AUTO"; fi
+if [[ -e $HOME/malachite-opal-screensaver.sh ]]; then echo 'Legacy installer detected: review old XScreenSaver and lock settings yourself; they were not changed.'; fi
+printf 'Installed native GTK/OpenGL viewer at %s\nPreview: python3 "%s/runner.py" preview\nLog out/in for autostart, or run: python3 "%s/runner.py" daemon\n' "$DATA" "$DATA" "$DATA"
+echo 'No browser required. Keep native locking enabled. COSMIC idle/lock behavior still requires desktop testing.'
