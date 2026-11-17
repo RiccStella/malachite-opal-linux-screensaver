@@ -72,6 +72,18 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.install('--no-autostart').returncode, 0)
         self.assertFalse((self.home / 'config/autostart/malachite-opal.desktop').exists())
 
+    def test_offline_artwork_installed_and_self_contained(self):
+        self.assertEqual(self.install().returncode, 0)
+        artwork = self.runner.with_name('artwork.html')
+        self.assertEqual(artwork.read_bytes(), (ROOT / 'artwork/index.html').read_bytes())
+        text = artwork.read_text()
+        self.assertNotIn('<script src=', text)
+        self.assertNotIn('$fx', text)
+        self.assertIn("connect-src 'none'", text)
+        self.assertIn('Alchemist', self.runner.with_name('ARTWORK-NOTICE.md').read_text())
+        module = self.load()
+        self.assertEqual(module.URL, artwork.as_uri())
+
     def test_private_profile_and_sandbox(self):
         self.assertEqual(self.install().returncode, 0)
         module = self.load()

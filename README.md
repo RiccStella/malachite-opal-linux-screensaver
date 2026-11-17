@@ -64,7 +64,8 @@ X11 uses `xprintidle` to detect idle/resume, rather than pretending a Chromium k
 - No root browser, `--no-sandbox`, `--disable-web-security`, personal cookies or extensions.
 - Temporary mode-0700 browser profile in your private `XDG_RUNTIME_DIR`; it is removed on normal cleanup.
 - Native Wayland browser backend on Wayland; process cleanup targets only the child process group this application created, never `pkill chromium`.
-- Artwork is fetched from the owner-hosted HTTPS page at `https://589arcade.com/assets/art/zooming/index.html` at runtime. The old FXHash gateway is no longer used. The hosting server and browser remain trust dependencies; its page and dependencies have **not** been audited or vendored. A separate profile does not prevent all network access or renderer vulnerabilities.
+- Artwork is bundled in the installer and opened using `file://`. Activating it requires **no Netlify/589arcade or FXHash request**, and works offline. A restrictive CSP blocks external resources and connections. Chromium's own system/background services are outside this artwork's bandwidth guarantee (background networking is disabled where Chromium supports it).
+- Artist credit is retained in `artwork/NOTICE.md`. FXHash SDK is not bundled; its random calls are replaced with `Math.random()`. The shader is unchanged, but minted seed reproducibility is not supported.
 - An artwork window lasts at most 60 seconds to limit resource use and interference from web content. Native lock events and suspend events are also used for cleanup when supplied by `swayidle`. This does **not** prove a malicious web page cannot affect the desktop's idle timing; verify native locking with the acceptance test.
 - Hard termination/power loss can leave a temporary profile until the runtime directory is cleared at logout. No persistent browser profile is reused.
 
@@ -80,11 +81,12 @@ Review your native desktop's lock settings, restore your preferred lock policy, 
 bash install-malachite-opal.sh --uninstall
 ```
 
-This stops the new supervisor and removes its runner, timeout and autostart file. Upgrade `.bak` files remain for recovery. System packages and native lock settings are left alone. It does not remove or alter legacy XScreenSaver files.
+This stops the new supervisor and removes its runner, timeout and autostart file. Upgrade `.bak` files remain for recovery. Bundled artwork and its attribution file are removed too. System packages and native lock settings are left alone. It does not remove or alter legacy XScreenSaver files.
 
 ## Development checks
 
 ```bash
+python3 tools/bundle_artwork.py --check
 bash -n install.sh
 python3 -m unittest discover -s tests -v
 shellcheck install.sh
